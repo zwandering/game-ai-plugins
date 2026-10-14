@@ -436,6 +436,17 @@
   function syncHistory(st) {
     if (st.myColor !== historyColor || st.stones <= 1 && history.length > 3) { history = []; historyColor = st.myColor; }
     if (history.length > st.stones + 1) history.length = st.stones + 1; // undo / new game
+    // the page marks the most recent stone; fall back to a board diff
+    const marker = st.boardEl.querySelector('.latest-move-marker');
+    const mcell = marker && marker.closest('.board-intersection');
+    if (mcell) {
+      const r = +mcell.dataset.row, c = +mcell.dataset.col;
+      if (r >= 0 && r < SIZE && c >= 0 && c < SIZE && st.board[r][c]) {
+        lastMove = { rc: { row: r, col: c }, color: st.board[r][c] };
+        prevBoard = st.board;
+        return;
+      }
+    }
     if (prevBoard && st.stones > 0) {
       // find a stone that is new compared with the previous position
       let found = null;
@@ -623,7 +634,12 @@
     }
 
     // A stale opponent-turn evaluation may still be running: it is short, so wait for it.
-    if (inFlight(p => p.type === 'evalPosition')) { schedule(100); return; }
+    if (inFlight(p => p.type === 'evalPosition')) {
+      // A stale opponent-turn evaluation is still running. Auto mode waits (it is
+      // short and keeps the engine's caches); hint mode cancels it.
+      if (settings.mode === 'auto') { schedule(100); return; }
+      restartWorker();
+    }
 
     const auto = settings.mode === 'auto';
     const wantAnalysis = !auto && (settings.showHeat || settings.showPv);
@@ -714,7 +730,9 @@
     evalKey = st.key;
     const opp = 3 - st.myColor;
     request({ type: 'evalPosition', board: st.board, color: opp, rule: st.rule, key: st.key,
-      timeMs: Math.min(800, Math.max(300, Math.round(settings.thinkMs / 2))) }, null, 800)
+      // hint mode: same think time as on my turn, so both turns' estimates are
+      // comparable; auto mode: keep it short so it never delays our own move
+      timeMs: settings.mode === 'auto' ? Math.min(800, Math.max(300, Math.round(settings.thinkMs / 2))) : Math.min(2500, settings.thinkMs) }, null, 2500)
       .then((res) => {
         const pMe = st.myColor === 1 ? res.winBlack : 1 - res.winBlack;
         recordWin(st.stones, st.key, pMe); // valid for that position even if the game moved on
