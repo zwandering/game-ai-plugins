@@ -19,7 +19,7 @@
   const SETTINGS_KEY = 'gomokuAI.settings.v1';
   const DEFAULTS = {
     mode: 'hint', thinkMs: 1500, delayMs: 600, collapsed: false, x: null, y: null,
-    showHeat: true, showPv: true,
+    showHeat: true, showPv: true, showOpp: true,
   };
   const HEAT_LABELS = 10; // candidate moves that get a number on the board (others get a dot)
 
@@ -195,11 +195,15 @@
   function cellName(rc) { return COLS[rc.col] + (SIZE - rc.row); }
   function colorName(c) { return c === 1 ? '黑' : c === 2 ? '白' : '?'; }
   function pct(p) { return Math.round(p * 100) + '%'; }
-  /** Text for a forced result (win rate exactly 0 or 1): how many own moves to five. */
-  function forcedText(score, win) {
-    const dist = 1000000 - Math.abs(score); // plies until the five, counted from my move
-    if (win === 0) return '必败：对方 ' + Math.max(1, Math.ceil((dist - 1) / 2)) + ' 步内可强制成五';
-    if (win === 1) return '必胜：' + Math.max(1, Math.ceil(dist / 2)) + ' 步内强制成五';
+  /**
+   * Text for a forced result (win rate exactly 0 or 1) of a move by `side`
+   * ('me' or 'opp'): who makes five and within how many of their own moves.
+   */
+  function forcedText(score, win, side) {
+    const dist = 1000000 - Math.abs(score); // plies until the five, counted from this move
+    const mover = side === 'opp' ? '对方' : '我方', other = side === 'opp' ? '我方' : '对方';
+    if (win === 0) return mover + '必败：' + other + ' ' + Math.max(1, Math.ceil((dist - 1) / 2)) + ' 步内可强制成五';
+    if (win === 1) return mover + '必胜：' + Math.max(1, Math.ceil(dist / 2)) + ' 步内强制成五';
     return '';
   }
   function signedPct(d) {
@@ -214,6 +218,8 @@
     border-radius:50%;border:3px solid #e5383b;box-shadow:0 0 0 2px rgba(255,255,255,.75),0 0 10px #e5383b;
     z-index:30;animation:gai-pulse 1.1s ease-in-out infinite}
   .gai-hint.gai-auto{border-color:#2b8a3e;box-shadow:0 0 0 2px rgba(255,255,255,.75),0 0 10px #2b8a3e}
+  .gai-hint.gai-opp{border:3px dashed #7048e8;box-shadow:0 0 0 2px rgba(255,255,255,.75),0 0 10px #7048e8}
+  .gai-heat.gai-oppv{box-shadow:0 0 0 1.5px #b197fc,0 1px 2px rgba(0,0,0,.4)}
   @keyframes gai-pulse{0%,100%{opacity:1}50%{opacity:.45}}
   .gai-ghost{position:absolute;left:50%;top:50%;width:72%;height:72%;transform:translate(-50%,-50%);border-radius:50%;
     display:flex;align-items:center;justify-content:center;font:700 11px/1 system-ui,sans-serif;z-index:28}
@@ -282,16 +288,20 @@
     return '#c92a2a';
   }
 
-  /** Draw everything we know about the current (my-turn) position. */
+  /**
+   * Draw everything we know about the current position: `a` is my analysis on
+   * my turn, or the opponent's (a.side === 'opp') on the opponent's turn.
+   */
   function drawOverlays(st, a) {
     clearOverlays();
     if (!a || !a.best || !a.best.move || settings.mode === 'off') return;
     const auto = settings.mode === 'auto';
+    const opp = a.side === 'opp';
     const cellAt = (rc) => st.cells.get(rc.row * SIZE + rc.col);
     // continuation (ghost stones), drawn first so the hint ring sits on top
     const ghostCells = new Set();
     if (settings.showPv && !auto && a.pv && a.pv.moves.length > 1) {
-      let c = st.myColor;
+      let c = a.color || st.myColor;
       a.pv.moves.forEach((rc, i) => {
         const cell = cellAt(rc);
         if (cell && st.board[rc.row][rc.col] === 0) {
@@ -309,13 +319,16 @@
         // cells showing a continuation stone keep only its number (hover shows the value)
         if (!cell || st.board[m.row][m.col] !== 0 || ghostCells.has(m.row * SIZE + m.col)) return;
         const d = m.win - a.positionWin;
-        // '×' marks a forced loss (hover for how fast), numbers are win rates in %
-        if (i < HEAT_LABELS || m.win === 0) addOverlay(cell, m.win === 0 ? 'gai-heat gai-lost' : 'gai-heat', m.win === 0 ? '×' : String(Math.round(m.win * 100)), { background: heatColor(d) });
+        // numbers are the mover's win rate in %; '×' = forced loss, '胜' = forced win
+        // (hover for how fast). The opponent's badges get a purple outline.
+        const label = m.win === 0 ? '×' : m.win === 1 ? '胜' : String(Math.round(m.win * 100));
+        const cls = 'gai-heat' + (m.win === 0 ? ' gai-lost' : '') + (opp ? ' gai-oppv' : '');
+        if (i < HEAT_LABELS || m.win === 0 || m.win === 1) addOverlay(cell, cls, label, { background: heatColor(d) });
         else addOverlay(cell, 'gai-dot', undefined, { background: heatColor(d) });
       });
     }
     const ring = cellAt(a.best.move);
-    if (ring) addOverlay(ring, 'gai-hint' + (auto ? ' gai-auto' : ''));
+    if (ring) addOverlay(ring, 'gai-hint' + (opp ? ' gai-opp' : auto ? ' gai-auto' : ''));
   }
 
   // ------------------------------------------------------------------ panel UI
@@ -351,6 +364,9 @@
           <label><input type="checkbox" class="gai-heat-cb">胜率热图</label>
           <label><input type="checkbox" class="gai-pv-cb">后续变化</label>
         </div>
+        <div class="gai-row">
+          <label title="对方回合时也分析：对方的最佳着法、各点的对方胜率和预计后续（紫色）"><input type="checkbox" class="gai-opp-cb">帮对手计算</label>
+        </div>
         <div class="gai-row"><span>思考时间</span><input class="gai-think" type="range" min="300" max="6000" step="100"><span class="gai-think-v gai-stat"></span></div>
         <div class="gai-row gai-delay-row"><span>落子延迟</span><input class="gai-delay" type="range" min="0" max="4000" step="100"><span class="gai-delay-v gai-stat"></span></div>
         <div class="gai-row" style="margin-top:6px"><button class="gai-now">立即计算</button><span class="gai-stat">Alt+A 切换自动</span></div>
@@ -362,18 +378,24 @@
       winNum: q('.gai-winnum'), winSplit: q('.gai-winsplit'), barFill: q('.gai-barfill'), chart: q('.gai-chart'), last: q('.gai-last'),
       think: q('.gai-think'), thinkV: q('.gai-think-v'), delay: q('.gai-delay'), delayV: q('.gai-delay-v'), delayRow: q('.gai-delay-row'),
       move: q('.gai-move'), status: q('.gai-status'), info: q('.gai-info'), hover: q('.gai-hover'), warn: q('.gai-warn'), alert: q('.gai-alert'),
-      heatCb: q('.gai-heat-cb'), pvCb: q('.gai-pv-cb'), now: q('.gai-now'), collapse: q('.gai-collapse'),
+      heatCb: q('.gai-heat-cb'), pvCb: q('.gai-pv-cb'), oppCb: q('.gai-opp-cb'), now: q('.gai-now'), collapse: q('.gai-collapse'),
     };
     ui.think.value = settings.thinkMs;
     ui.delay.value = settings.delayMs;
     ui.heatCb.checked = !!settings.showHeat;
     ui.pvCb.checked = !!settings.showPv;
+    ui.oppCb.checked = !!settings.showOpp;
     ui.modeBtns.forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
     ui.think.addEventListener('input', () => { settings.thinkMs = +ui.think.value; saveSettings(); renderSettings(); });
     ui.think.addEventListener('change', () => { invalidate(); schedule(0); });
     ui.delay.addEventListener('input', () => { settings.delayMs = +ui.delay.value; saveSettings(); renderSettings(); });
     ui.heatCb.addEventListener('change', () => { settings.showHeat = ui.heatCb.checked; saveSettings(); onDisplayToggle(); });
     ui.pvCb.addEventListener('change', () => { settings.showPv = ui.pvCb.checked; saveSettings(); onDisplayToggle(); });
+    ui.oppCb.addEventListener('change', () => {
+      settings.showOpp = ui.oppCb.checked; saveSettings();
+      oppAnalysis = null; evalKey = '';
+      onDisplayToggle();
+    });
     ui.now.addEventListener('click', () => { invalidate(); schedule(0, true); });
     ui.collapse.addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); renderSettings(); });
     makeDraggable(panel, q('.gai-head'));
@@ -544,17 +566,22 @@
     const st = lastState;
     const r = +cell.dataset.row, c = +cell.dataset.col;
     const name = cellName({ row: r, col: c });
-    if (!st || !st.myTurn || !analysis || analysis.key !== st.key || settings.mode === 'off' || st.board[r][c]) {
+    const a = st && (st.myTurn ? analysis : oppAnalysis);
+    if (!st || !a || a.key !== st.key || settings.mode === 'off' || st.board[r][c]) {
       ui.hover.textContent = ' ';
       return;
     }
-    const base = analysis.positionWin;
+    const opp = a.side === 'opp';
+    const base = a.positionWin;
     const show = (win, note, score) => {
-      if (win === null) { ui.hover.textContent = `若下 ${name}：${note}`; return; }
-      const forced = (win === 0 || win === 1) && score !== undefined ? '，' + forcedText(score, win) : '';
-      ui.hover.textContent = `若下 ${name}：我方胜率 ${pct(win)}（${base !== undefined ? signedPct(win - base) : ''}）${forced}${note || ''}`;
+      if (win === null) { ui.hover.textContent = `${opp ? '若对方下' : '若下'} ${name}：${note}`; return; }
+      const forced = (win === 0 || win === 1) && score !== undefined ? '，' + forcedText(score, win, a.side) : '';
+      const delta = base !== undefined ? '（' + signedPct(win - base) + '）' : '';
+      ui.hover.textContent = opp
+        ? `若对方下 ${name}：对方胜率 ${pct(win)}${delta}，我方 ${pct(1 - win)}${forced}${note || ''}`
+        : `若下 ${name}：我方胜率 ${pct(win)}${delta}${forced}${note || ''}`;
     };
-    const m = analysis.moves && analysis.moves.find(x => x.row === r && x.col === c);
+    const m = a.moves && a.moves.find(x => x.row === r && x.col === c);
     if (m) { show(m.win, '', m.score); return; }
     const hk = st.key + '|' + r + ',' + c;
     if (hoverCache.has(hk)) {
@@ -564,7 +591,7 @@
     }
     show(null, '计算中…');
     hoverTimer = setTimeout(() => {
-      request({ type: 'evalMove', board: st.board, color: st.myColor, rule: st.rule, row: r, col: c, timeMs: 350, key: st.key }, null, 350)
+      request({ type: 'evalMove', board: st.board, color: a.color || st.myColor, rule: st.rule, row: r, col: c, timeMs: 350, key: st.key }, null, 350)
         .then((res) => {
           hoverCache.set(hk, res);
           if (hoverCell === cell && lastState && lastState.key === st.key) showHover(cell);
@@ -576,7 +603,8 @@
   // ------------------------------------------------------------------ main loop
   let busy = false;          // a my-turn job (think/analyze) is running
   let lastState = null;
-  let analysis = null;       // { key, best, moves, positionWin, pv } for my current position
+  let analysis = null;       // { key, side: 'me', color, best, moves, positionWin, pv } for my current position
+  let oppAnalysis = null;    // the same for the opponent, computed on the opponent's turn
   let lastKey = '';          // position key we already handled
   let clickAttempts = 0;
   let lastClickAt = 0;
@@ -598,6 +626,12 @@
     if (analysis && st && analysis.key === st.key) {
       if ((settings.showHeat && !analysis.moves) || (settings.showPv && !analysis.pv && analysis.done)) invalidate();
       else drawOverlays(st, analysis);
+    } else if (st && !st.myTurn) {
+      if (oppAnalysis && oppAnalysis.key === st.key) {
+        if ((settings.showHeat && !oppAnalysis.moves) || (settings.showPv && !oppAnalysis.pv && oppAnalysis.done)) { oppAnalysis = null; evalKey = ''; }
+        else drawOverlays(st, oppAnalysis);
+      }
+      if (!settings.showOpp) { clearOverlays(); setAlert(''); }
     }
     schedule(0);
   }
@@ -630,8 +664,14 @@
     setWarn('');
 
     if (!st.myTurn) {
-      if (!analysis || analysis.key !== st.key) { clearOverlays(); setAlert(''); }
-      setStatus('我方执' + colorName(st.myColor) + '，等待对手…', st.pendingMove ? '' : undefined);
+      const oa = oppAnalysis && oppAnalysis.key === st.key ? oppAnalysis : null;
+      if (!oa) { if (!analysis || analysis.key !== st.key) { clearOverlays(); setAlert(''); } }
+      else if (overlaysLost() || overlayEls.length === 0) drawOverlays(st, oa);
+      if (oa && oa.best && oa.best.move) {
+        setStatus('对方回合 · 对方最佳 ' + cellName(oa.best.move) + (oa.positionWin !== undefined ? '（对方胜率 ' + pct(oa.positionWin) + '）' : ''));
+      } else {
+        setStatus('我方执' + colorName(st.myColor) + '，等待对手…' + (settings.showOpp && settings.mode === 'hint' ? '（正在帮对手计算）' : ''), st.pendingMove ? '' : undefined);
+      }
       evaluateOpponentTurn(st);
       return;
     }
@@ -648,7 +688,7 @@
       return;
     }
 
-    if (inFlight(p => p.type === 'evalPosition')) {
+    if (inFlight(p => p.key !== st.key && (p.type === 'evalPosition' || p.type === 'analyze'))) {
       // A stale opponent-turn evaluation is still running. Auto mode waits (it is
       // short and keeps the engine's caches); hint mode cancels it.
       if (settings.mode === 'auto') { schedule(100); return; }
@@ -659,7 +699,7 @@
     const wantAnalysis = !auto && (settings.showHeat || settings.showPv);
     busy = true; renderSettings();
     lastKey = st.key; clickAttempts = 0;
-    const a = { key: st.key, best: null, moves: null, positionWin: undefined, pv: null, done: false };
+    const a = { key: st.key, side: 'me', color: st.myColor, best: null, moves: null, positionWin: undefined, pv: null, done: false };
     analysis = a;
     clearOverlays();
     setAlert('');
@@ -747,12 +787,59 @@
     }
   }
 
-  /** On the opponent's turn: evaluate the position once for the live win rate. */
+  /** Warnings derived from the opponent's analysis (their win rates). */
+  function opponentAlert(oa) {
+    const alive = oa.moves.filter(m => m.win > 0);
+    const lost = oa.moves.length - alive.length;
+    if (oa.positionWin === 1 && oa.best && oa.best.move) {
+      return '注意：对方有必胜手段，最佳是 ' + cellName(oa.best.move) + '（' + forcedText(oa.bestScore !== undefined ? oa.bestScore : 999999, 1, 'opp') + '）';
+    }
+    if (alive.length === 0 && lost > 0) return '对方已无法防守：我方有强制取胜手段';
+    if (lost >= 5 && alive.length <= 3) return '我方有强制攻势：对方只有 ' + alive.map(m => cellName(m)).join('、') + ' 能防住';
+    return '';
+  }
+
+  /**
+   * On the opponent's turn: in hint mode (with "帮对手计算"), analyse the
+   * position for the opponent exactly like my own turn — their best move, their
+   * win rate after each candidate move, and their expected continuation. Otherwise
+   * (or in auto mode, which must not be delayed) a quick evaluation only.
+   */
   function evaluateOpponentTurn(st) {
     if (evalKey === st.key || st.pendingMove) return;
     if (inFlight(() => true)) { schedule(150); return; }
     evalKey = st.key;
     const opp = 3 - st.myColor;
+    if (settings.mode === 'hint' && settings.showOpp) {
+      const thinkMs = settings.thinkMs;
+      const oa = { key: st.key, side: 'opp', color: opp, best: null, moves: null, positionWin: undefined, pv: null, done: false };
+      oppAnalysis = oa;
+      const current = () => oppAnalysis === oa && lastState && lastState.key === oa.key && !lastState.myTurn;
+      request({
+        type: 'analyze', board: st.board, color: opp, rule: st.rule, key: st.key,
+        timeMs: thinkMs, analysisMs: Math.max(600, Math.round(thinkMs * 0.8)), maxMoves: 40,
+        pvPlies: settings.showPv ? 9 : 1, pvMs: Math.max(60, Math.min(250, Math.round(thinkMs / 10))),
+      }, (stage, res) => {
+        if (stage === 'best') {
+          oa.best = res;
+          if (res.win !== null && res.win !== undefined) { oa.positionWin = res.win; oa.bestScore = res.score; recordWin(st.stones, st.key, 1 - res.win); }
+          if (current()) { drawOverlays(lastState, oa); schedule(0); }
+        } else if (stage === 'moves') {
+          oa.moves = res.moves; oa.positionWin = res.positionWin; oa.bestScore = res.bestScore;
+          recordWin(st.stones, st.key, 1 - res.positionWin);
+          if (current()) { drawOverlays(lastState, oa); setAlert(opponentAlert(oa)); schedule(0); }
+        } else if (stage === 'pv') {
+          oa.pv = res;
+          if (current()) {
+            drawOverlays(lastState, oa);
+            if (res.moves.length > 1) ui.info.textContent = '对方后续: ' + res.moves.map(cellName).join(' ') + (res.winner ? '（' + colorName(res.winner) + '胜）' : '');
+          }
+        }
+      }, thinkMs * 3)
+        .then(() => { oa.done = true; schedule(0); })
+        .catch(() => { if (evalKey === st.key) evalKey = ''; });
+      return;
+    }
     request({ type: 'evalPosition', board: st.board, color: opp, rule: st.rule, key: st.key,
       // hint mode: same think time as on my turn, so both turns' estimates are
       // comparable; auto mode: keep it short so it never delays our own move
@@ -800,11 +887,12 @@
           const nodes = [...m.addedNodes, ...m.removedNodes];
           if (nodes.length && nodes.every(isOwnNode)) continue;
         }
-        // A position change makes a running (long) analysis useless: cancel it.
-        if (busy && analysis && !analysis.done) {
+        // A position change makes a running (long) analysis useless: cancel it
+        // (mine or the opponent's).
+        if (inFlight(p => p.type === 'analyze')) {
           const st = readState();
-          if (st && st.key !== analysis.key && inFlight(p => p.type === 'analyze')) {
-            busy = false; analysis = null; lastKey = '';
+          if (st && inFlight(p => p.type === 'analyze' && p.key !== st.key)) {
+            if (busy && analysis && !analysis.done && analysis.key !== st.key) { busy = false; analysis = null; lastKey = ''; }
             restartWorker();
           }
         }
@@ -829,7 +917,7 @@
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.2.1',
+    readState, setMode, settings, version: '1.3.0',
     debug: () => ({ analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
