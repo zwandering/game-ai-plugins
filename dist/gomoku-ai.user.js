@@ -1955,7 +1955,6 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       return;
     }
 
-    // A stale opponent-turn evaluation may still be running: it is short, so wait for it.
     if (inFlight(p => p.type === 'evalPosition')) {
       // A stale opponent-turn evaluation is still running. Auto mode waits (it is
       // short and keeps the engine's caches); hint mode cancels it.
