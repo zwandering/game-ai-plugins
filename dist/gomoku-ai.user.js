@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gomoku AI 助手 (gomoku.com)
 // @namespace    https://github.com/local/gomoku-ai-plugin
-// @version      1.4.0
+// @version      1.4.1
 // @description  为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。
 // @match        https://gomoku.com/*
 // @match        https://www.gomoku.com/*
@@ -1611,13 +1611,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const auto = settings.mode === 'auto';
     const opp = a.side === 'opp';
     const cellAt = (rc) => st.cells.get(rc.row * SIZE + rc.col);
-    // While a cell is hovered, its own continuation is shown instead of the
-    // recommended one (and the heat map is hidden to keep the board readable).
+    // By default only the win-rate preview (heat map) is shown. A continuation is
+    // drawn only for the cell under the mouse (and the heat map is hidden then).
     const pre = preview && preview.key === a.key && preview.line && preview.line.moves.length > 1 ? preview.line : null;
-    const line = pre || a.pv;
+    const line = pre;
     // continuation (ghost stones), drawn first so the hint ring sits on top
     const ghostCells = new Set();
-    if (!auto && line && line.moves.length > 1 && (pre || settings.showPv)) {
+    if (!auto && line) {
       let c = a.color || st.myColor;
       line.moves.forEach((rc, i) => {
         const cell = cellAt(rc);
@@ -1679,7 +1679,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         <div class="gai-sep"></div>
         <div class="gai-row">
           <label><input type="checkbox" class="gai-heat-cb">胜率热图</label>
-          <label><input type="checkbox" class="gai-pv-cb">后续变化</label>
+          <label title="鼠标停在某个点上时，在棋盘上画出下在那里的后续变化"><input type="checkbox" class="gai-pv-cb">悬停显示后续</label>
         </div>
         <div class="gai-row">
           <label title="对方回合时也分析：对方的最佳着法、各点的对方胜率和预计后续（紫色）"><input type="checkbox" class="gai-opp-cb">帮对手计算</label>
@@ -1877,9 +1877,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     preview = p;
     const a = currentAnalysis();
     if (a && lastState) drawOverlays(lastState, a);
-    if (!p && a && a.pv && a.pv.moves.length > 1) {
-      ui.info.textContent = (a.side === 'opp' ? '对方后续: ' : '后续: ') + a.pv.moves.map(cellName).join(' ') + (a.pv.winner ? '（' + colorName(a.pv.winner) + '胜）' : '');
-    }
+    if (!p && a) ui.info.textContent = a.info || '';
   }
 
   function attachHover(boardEl) {
@@ -1915,7 +1913,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     // the recommended move already has its continuation
     const isBest = a.best && a.best.move && a.best.move.row === r && a.best.move.col === c;
     const showLine = (ln) => {
-      if (settings.mode === 'auto') return;
+      if (settings.mode === 'auto' || !settings.showPv) return;
       setPreview(ln ? { key: st.key, rc: { row: r, col: c }, line: ln } : null);
       if (ln && ln.moves.length > 1) ui.info.textContent = lineText(ln);
     };
@@ -2062,9 +2060,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       a.best = res;
       if (!stillCurrent()) return;
       ui.move.textContent = res.move ? cellName(res.move) : '—';
-      const pvText = res.pv && res.pv.length > 1 ? '  主变: ' + res.pv.slice(0, 6).map(cellName).join(' ') : '';
-      setStatus('执' + colorName(st.myColor) + ' · 评估 ' + formatScore(res),
-        '深度 ' + res.depth + ' · ' + (res.nodes / 1000).toFixed(1) + 'k 节点 · ' + res.timeMs + 'ms' + pvText);
+      a.info = '深度 ' + res.depth + ' · ' + (res.nodes / 1000).toFixed(1) + 'k 节点 · ' + res.timeMs + 'ms' +
+        (settings.showPv && settings.mode !== 'auto' ? ' · 鼠标停在点上可看后续变化' : '');
+      setStatus('执' + colorName(st.myColor) + ' · 评估 ' + formatScore(res), preview ? undefined : a.info);
       if (res.win !== null && res.win !== undefined) { a.positionWin = res.win; recordWin(st.stones, st.key, res.win); }
       drawOverlays(lastState, a);
     };
@@ -2092,13 +2090,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
               } else setAlert('');
             }
           } else if (stage === 'pv') {
-            a.pv = res;
-            if (stillCurrent()) {
-              drawOverlays(lastState, a);
-              if (res.moves.length > 1) {
-                ui.info.textContent = '后续: ' + res.moves.map(cellName).join(' ') + (res.winner ? '（' + colorName(res.winner) + '胜）' : '');
-              }
-            }
+            a.pv = res; // kept for an instant preview when the recommended move is hovered
           }
         }, settings.thinkMs * 3);
         a.done = true;
@@ -2175,6 +2167,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       }, (stage, res) => {
         if (stage === 'best') {
           oa.best = res;
+          oa.info = settings.showPv ? '鼠标停在点上可看对方下在那里的后续变化' : '';
+          if (current() && !preview) ui.info.textContent = oa.info;
           if (res.win !== null && res.win !== undefined) { oa.positionWin = res.win; oa.bestScore = res.score; recordWin(st.stones, st.key, 1 - res.win); }
           if (current()) { drawOverlays(lastState, oa); schedule(0); }
         } else if (stage === 'moves') {
@@ -2182,11 +2176,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
           recordWin(st.stones, st.key, 1 - res.positionWin);
           if (current()) { drawOverlays(lastState, oa); setAlert(opponentAlert(oa)); schedule(0); }
         } else if (stage === 'pv') {
-          oa.pv = res;
-          if (current()) {
-            drawOverlays(lastState, oa);
-            if (res.moves.length > 1) ui.info.textContent = '对方后续: ' + res.moves.map(cellName).join(' ') + (res.winner ? '（' + colorName(res.winner) + '胜）' : '');
-          }
+          oa.pv = res; // kept for an instant preview when the opponent's best move is hovered
         }
       }, thinkMs * 3)
         .then(() => { oa.done = true; schedule(0); })
@@ -2270,7 +2260,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.4.0',
+    readState, setMode, settings, version: '1.4.1',
     debug: () => ({ analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

@@ -1,8 +1,9 @@
 'use strict';
-// Scenario: hint mode. Hovering an empty cell must show the expected continuation
+// Scenario: hint mode. By default only the win-rate heat map is shown (no
+// continuation stones). Hovering an empty cell shows the expected continuation
 // if that move were played (ghost 1 on the hovered cell, then the opponent's
-// replies), hide the heat map while previewing, and restore the recommended
-// continuation when the mouse leaves the board. Also on the opponent's turn.
+// replies) and hides the heat map; leaving the board goes back to the heat map
+// only. Also on the opponent's turn.
 // Usage: node test/controller-sim-preview.js
 const { setup } = require('./controller-sim-fakedom.js');
 const S = setup({ settings: { mode: 'hint', thinkMs: 400, delayMs: 0, showHeat: true, showPv: true, showOpp: true } });
@@ -34,8 +35,8 @@ const isEmpty = i => !S.cells[i].children.some(ch => ch._cls.has('stone'));
   await sleep(3500);
   let o = overlays();
   const best = o.ring[0];
-  const recGhost1 = (o.ghosts.find(g => g.n === 1) || {}).i;
-  check(o.heat > 0 && o.ghosts.length > 1, `my turn: heat (${o.heat}) and recommended continuation (${o.ghosts.length} stones)`);
+  check(o.heat > 0 && o.ghosts.length === 0, `my turn default: win-rate heat map (${o.heat} badges), no continuation stones (${o.ghosts.length})`);
+  check(!/后续: /.test(text('.gai-info')), 'panel does not list a continuation by default: ' + text('.gai-info'));
 
   // hover a different empty cell near the stones
   let target = -1;
@@ -55,7 +56,7 @@ const isEmpty = i => !S.cells[i].children.some(ch => ch._cls.has('stone'));
   leave();
   await sleep(200);
   o = overlays();
-  check((o.ghosts.find(g => g.n === 1) || {}).i === recGhost1 && o.heat > 0, 'after leaving: recommended continuation and heat map restored');
+  check(o.ghosts.length === 0 && o.heat > 0, 'after leaving: back to the heat map only, no continuation stones');
 
   // hovering the recommended move shows its continuation immediately
   hover(best);
@@ -69,6 +70,7 @@ const isEmpty = i => !S.cells[i].children.some(ch => ch._cls.has('stone'));
   S.turn.textContent = 'Opponent Turn';
   await sleep(4500);
   o = overlays();
+  check(o.ghosts.length === 0 && o.heat > 0, 'opponent turn default: heat map only, no continuation stones');
   const oppBest = o.oppRing[0];
   let t2 = -1;
   for (let i = 0; i < 225; i++) if (isEmpty(i) && i !== oppBest && S.cells[i].children.some(ch => ch._cls.has('gai-heat'))) { t2 = i; break; }
