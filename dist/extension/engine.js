@@ -171,7 +171,7 @@ function createGomokuEngine() {
     for (let i = 0, j = n - 1; i < j; i++, j--) { const t = sub[i]; sub[i] = sub[j]; sub[j] = t; }
   }
 
-  const CACHE_LIMIT = 400000;
+  const CACHE_LIMIT = 150000;
 
   // ------------------------------------------------------------------ engine
   class Engine {
@@ -202,6 +202,8 @@ function createGomokuEngine() {
       // threat-search caches: position+attacker -> remaining plies already proven insufficient
       this.vcfFail = new Map();
       this.vctFail = new Map();
+      // proven wins: position+attacker -> winningMove * 64 + plies (positions only, so always valid)
+      this.vctWin = new Map();
       // search scratch
       this.candBuf = [];
       for (let i = 0; i <= MAX_PLY + 2; i++) this.candBuf.push(new Float64Array(N));
@@ -210,6 +212,7 @@ function createGomokuEngine() {
       this.deadline = Infinity; this.aborted = false;
       this.rootBest = -1; this.rootScore = -INF;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
+      this.winning = false; // last think() found a forced win: keep following it with more VCT time
       this.reset();
     }
 
@@ -229,13 +232,23 @@ function createGomokuEngine() {
 
     /** Load a full board: flat array of 225 values or 15 rows of 15 (0 empty, 1 black, 2 white). */
     setBoard(arr) {
-      this.reset();
       const flat = Array.isArray(arr[0]) ? [].concat.apply([], arr) : arr;
+      // Threat caches stay valid across positions, but they only help within one
+      // game: drop them when the new board is not a continuation of the old one.
+      for (let p = 0; p < N; p++) {
+        if (this.board[p] !== EMPTY && (flat[p] | 0) !== this.board[p]) { this.clearCaches(); break; }
+      }
+      this.reset();
       for (let p = 0; p < N; p++) {
         const v = flat[p] | 0;
         if (v === BLACK || v === WHITE) this.play(p, v);
       }
       this.history.length = 0;
+    }
+
+    clearCaches() {
+      this.vcfFail.clear(); this.vctFail.clear(); this.vctWin.clear();
+      this.winning = false;
     }
 
     tableFor(c) { return (this.rule === 'renju' && c === BLACK) ? TABLE_RENJU_BLACK : TABLE_FREE; }
@@ -418,11 +431,20 @@ function createGomokuEngine() {
       const buf = this.candBuf[ply];
       const mi = me - 1, oi = 2 - me;
       const renjuBlack = this.rule === 'renju' && me === BLACK;
+      // Renju, white defending: black's forbidden points have category NONE, but
+      // occupying one can still break a black threat (e.g. the forbidden end of an
+      // open three), so also look at black's raw per-direction shapes.
+      const renjuWhite = this.rule === 'renju' && me === WHITE;
+      const shape = this.shape;
       let n = 0;
       for (let p = 0; p < N; p++) {
         if (this.board[p] !== EMPTY) continue;
         const cm = this.cat[mi * N + p], co = this.cat[oi * N + p];
-        if (cm >= CAT_FOUR || co >= CAT_FOUR) {
+        let blocks = co >= CAT_FOUR;
+        if (!blocks && renjuWhite) {
+          for (let d = 0; d < 4; d++) { const sh = shape[d * N + p]; if (sh >= S_FOUR) { blocks = true; break; } }
+        }
+        if (cm >= CAT_FOUR || blocks) {
           if (renjuBlack && cm === CAT_NONE && this.isForbidden(p)) continue;
           buf[n++] = (this.score[mi * N + p] * 11 + this.score[oi * N + p] * 10) * 256 + p;
         }
@@ -572,10 +594,15 @@ function createGomokuEngine() {
         if (root) this.vctMove = this.firstCellWithCat(me, CAT_WIN2);
         return 3;
       }
+      const key = this.posKey(me);
+      const won = this.vctWin.get(key);
+      if (won !== undefined && this.board[won >> 6] === EMPTY) {
+        if (root) this.vctMove = won >> 6;
+        return won & 63;
+      }
       const rem = maxPly - (ply - this.vctRoot);
       if (rem <= 0 || this.vctNodes <= 0) return 0;
       if ((this.vctNodes & 63) === 0 && now() > this.vctDeadline) { this.vctNodes = 0; return 0; }
-      const key = this.posKey(me);
       const failed = this.vctFail.get(key);
       if (failed !== undefined && failed >= rem) return 0;
 
@@ -583,7 +610,11 @@ function createGomokuEngine() {
       if (this.catCount[mi * 5 + CAT_FOUR] > 0) {
         this.vcfNodes = 400; this.vcfMove = -1;
         const f = this.vcf(me, ply, rem, ply);
-        if (f) { if (root) this.vctMove = this.vcfMove; return f; }
+        if (f) {
+          if (root) this.vctMove = this.vcfMove;
+          this.rememberWin(key, this.vcfMove, f);
+          return f;
+        }
       }
 
       // Attacking moves: fours and open threes, best first.
@@ -603,6 +634,7 @@ function createGomokuEngine() {
         this.undo();
         if (r) {
           if (root) this.vctMove = p;
+          this.rememberWin(key, p, r + 1);
           return r + 1;
         }
         if (this.vctNodes <= 0) return 0;
@@ -612,6 +644,12 @@ function createGomokuEngine() {
         this.vctFail.set(key, rem);
       }
       return 0;
+    }
+
+    rememberWin(key, move, plies) {
+      if (move < 0) return;
+      if (this.vctWin.size > CACHE_LIMIT) this.vctWin.clear();
+      this.vctWin.set(key, move * 64 + Math.min(63, plies));
     }
 
     /** Defender (3 - me) to move after an attacking move of `me`. */
@@ -768,6 +806,7 @@ function createGomokuEngine() {
       const maxDepth = opts.maxDepth || 16;
       const useVct = opts.vct !== false;
       const t0 = now();
+      const marks = {}; let tm = t0;
       const opp = 3 - me, mi = me - 1, oi = opp - 1;
       this.nodes = 0; this.aborted = false; this.gen = (this.gen + 1) & 255;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
@@ -779,7 +818,7 @@ function createGomokuEngine() {
         }
         return {
           move, score, reason, depth: depth || 0, nodes: this.nodes,
-          timeMs: Math.round(now() - t0), pv: this.extractPv(me, move),
+          timeMs: Math.round(now() - t0), pv: this.extractPv(me, move), phases: marks,
         };
       };
 
@@ -802,20 +841,33 @@ function createGomokuEngine() {
       if (this.catCount[mi * 5 + CAT_WIN2] > 0) return done(this.firstCellWithCat(me, CAT_WIN2), WIN - 3, 'open-four', 3);
 
       // Own VCF at the root (deep, generous budget).
-      const own = this.findVcf(me, opts.vcfNodes || 60000, 30);
-      if (own && own.move >= 0) return done(own.move, WIN - own.plies, 'vcf', own.plies);
+      tm = now();
+      const mark = (k) => { const t = now(); marks[k] = Math.round(t - tm); tm = t; };
+      const own = this.findVcf(me, opts.vcfNodes || 60000, 30); mark('ownVcf');
+      if (own && own.move >= 0) { this.winning = true; return done(own.move, WIN - own.plies, 'vcf', own.plies); }
 
       // Own VCT (threes and fours), unless the opponent can win by fours first.
+      // When the previous move already found a forced win, spend most of the
+      // time re-finding it so the attack is not dropped halfway.
+      const wasWinning = this.winning;
+      this.winning = false;
       const oppVcf = (this.catCount[oi * 5 + CAT_FOUR] > 0 || this.catCount[oi * 5 + CAT_WIN2] > 0)
         ? this.findVcf(opp, 60000, 30) : null;
-      if (useVct && !oppVcf && this.catCount[oi * 5 + CAT_WIN2] === 0) {
-        const vct = this.findVct(me, 40000, 14, t0 + timeMs * 0.2);
-        if (vct && vct.move >= 0) return done(vct.move, WIN - vct.plies, 'vct', vct.plies);
+      mark('oppVcf');
+      // (Sound even when the opponent has threats of its own: the VCT tree lets the
+      // defender answer with counter-fours and open fours.)
+      if (useVct) {
+        const vct = wasWinning
+          ? this.findVct(me, 400000, 20, t0 + timeMs * 0.7)
+          : this.findVct(me, 40000, 14, t0 + timeMs * 0.15);
+        if (vct && vct.move >= 0) { this.winning = true; return done(vct.move, WIN - vct.plies, 'vct', vct.plies); }
       }
 
       // Opponent threat sequences: only consider moves after which they are gone.
       let oppVct = null;
-      if (useVct && !oppVcf) oppVct = this.findVct(opp, 20000, 12, t0 + timeMs * 0.35);
+      mark('ownVct');
+      if (useVct && opts.oppVct !== false && !oppVcf) oppVct = this.findVct(opp, 20000, 12, now() + timeMs * 0.15);
+      mark('oppVct');
       if (oppVcf || oppVct) {
         const safe = new Set();
         const n = this.genNormal(me, 0, 60);
@@ -823,18 +875,21 @@ function createGomokuEngine() {
         for (let i = 0; i < n; i++) cands.push(this.candBuf[0][i] % 256);
         // also every move that makes a four (forcing replies)
         for (let p = 0; p < N; p++) if (this.cat[mi * N + p] >= CAT_FOUR && cands.indexOf(p) < 0) cands.push(p);
-        const t1 = now(), budget = timeMs * 0.3;
+        const t1 = now(), budget = timeMs * 0.2;
         for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
-          if (!this.stillThreatened(cands[i], me, useVct, t1 + budget)) safe.add(cands[i]);
+          if (!this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget)) safe.add(cands[i]);
         }
         if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
       }
 
       // Iterative deepening.
+      mark('filter');
       this.deadline = t0 + timeMs;
+      const tSearch = now();
       let bestMove = -1, bestScore = 0, bestDepth = 0;
       for (let depth = 2; depth <= maxDepth; depth += 1) {
         this.rootBest = -1; this.rootScore = -INF;
+        const tIter = now();
         const s = this.negamax(me, depth, -INF, INF, 0, 3);
         if (this.aborted) {
           // The first root move searched is the previous best (TT move); any root
@@ -846,7 +901,13 @@ function createGomokuEngine() {
         }
         if (this.rootBest >= 0) { bestMove = this.rootBest; bestScore = s; bestDepth = depth; }
         if (Math.abs(s) >= WIN_THRESHOLD) break;
-        if (now() - t0 > timeMs * 0.4) break; // next iteration would not finish
+        const tNow = now();
+        if (opts.idStop === 'predict') {
+          // Stop if the next iteration (typically ~3x the last one) cannot finish in time.
+          if (tNow + (tNow - tIter) * 3 > this.deadline) break;
+        } else if (tNow - tSearch > (this.deadline - tSearch) * 0.45) {
+          break; // start another iteration only while less than ~half of the search time is used
+        }
       }
       if (bestMove < 0 || !this.legal(bestMove, me)) {
         const n = this.genNormal(me, 0, 1);

@@ -160,6 +160,9 @@ function boardText(board, mark) {
 }
 
 // --opp engine:<ms> replaces the baseline by a second engine instance with a longer think time (to expose horizon blunders)
+// --engopts '{"vct":false}' passes extra options to the tested engine's think().
+const ENGINE_OPTS = JSON.parse(arg('engopts', '{}'));
+const OPEN_STONES = +arg('open', 2);
 // --opp v1:<ms> uses the previous engine version (test/engine-v1.js) instead.
 const OPP_SPEC = arg("opp", "baseline");
 const OPP_MS = (() => { const m = /^(engine|v1):(\d+)$/.exec(OPP_SPEC); return m ? +m[2] : 0; })();
@@ -182,14 +185,17 @@ function playGame(gi, rule, timeMs, baseSeed, engine, oracle) {
   };
   const b0 = pick(7, 7, 1); board[b0] = 1; moves.push({ p: b0, c: 1, who: 'open' });
   const w0 = pick((b0 / SIZE) | 0, b0 % SIZE, 2); board[w0] = 2; moves.push({ p: w0, c: 2, who: 'open' });
-  let color = 1, result = null, engTimes = [], violations = [];
+  // --open K: K opening stones in total (default 2), extra ones within 2 of the centre
+  let color = 1;
+  for (let k = 2; k < OPEN_STONES; k++) { const q = pick(7, 7, 2); board[q] = color; moves.push({ p: q, c: color, who: 'open' }); color = 3 - color; }
+  let result = null, engTimes = [], violations = [];
   const isForbOracle = (p, b) => { oracle.setBoard(b); return oracle.isForbidden(p); };
   while (!result) {
     if (moves.length >= N) { result = { winner: 0, why: 'board-full' }; break; }
     let p, info = null;
     if (color === engineColor) {
       engine.setBoard(board);
-      const r = engine.think(color, { timeMs });
+      const r = engine.think(color, Object.assign({ timeMs }, ENGINE_OPTS));
       p = r.move; info = { score: r.score, depth: r.depth, reason: r.reason, timeMs: r.timeMs, nodes: r.nodes };
       engTimes.push(r.timeMs);
     } else {
@@ -230,7 +236,9 @@ function summarise(games) {
 function mainPlay() {
   const rule = arg('rule', 'freestyle');
   const games = +arg('games', 30), start = +arg('start', 0), timeMs = +arg('time', 300), baseSeed = +arg('seed', 1000);
-  const engine = new Engine({ rule }), oracle = new Engine({ rule });
+  // --engine v1 makes the previous engine version the tested side (for control runs)
+  const TestEngine = arg('engine', 'current') === 'v1' ? require('./engine-v1.js')().Engine : Engine;
+  const engine = new TestEngine({ rule }), oracle = new Engine({ rule });
   const out = [];
   for (let gi = start; gi < start + games; gi++) {
     const g = playGame(gi, rule, timeMs, baseSeed, engine, oracle);
