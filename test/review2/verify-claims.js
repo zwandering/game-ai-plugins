@@ -24,12 +24,12 @@ function verifier(rule) {
     V.clearCaches();
     let r = V.findVcf(att, 60000, 30);
     if (r && r.move >= 0) return r.move;
-    V.clearCaches();
-    r = V.findVct(att, 60000, 16, Infinity);
-    if (r && r.move >= 0) return r.move;
-    V.clearCaches();
-    r = V.findVct(att, 600000, 24, Infinity);
-    if (r && r.move >= 0) return r.move;
+    // findVct is not monotone in (nodes, maxPly): try several settings
+    for (const [n, d] of [[40000, 14], [20000, 10], [100000, 12], [60000, 16], [400000, 20]].concat(process.env.PROVE_DEEP ? [[2000000, 30]] : [])) {
+      V.clearCaches();
+      r = V.findVct(att, n, d, Infinity);
+      if (r && r.move >= 0) return r.move;
+    }
     return -1;
   }
   // attacker to move. returns {ok:true} | {ok:false, line, why}
@@ -97,7 +97,10 @@ const ver = verifier(pos[0].rule);
 const E = new G.Engine({ rule: pos[0].rule });
 let claims = 0, ok = 0, bad = 0, unk = 0;
 const t0 = Date.now();
-for (let i = start; i < pos.length && Date.now() - t0 < 250000; i += step) {
+const idxList = process.env.IDX ? process.env.IDX.split(',').map(Number) : null;
+const order = idxList || []; if (!idxList) for (let i = start; i < pos.length; i += step) order.push(i);
+for (const i of order) {
+  if (Date.now() - t0 > +(process.env.TLIM || 250000)) break;
   const P = pos[i];
   for (const a of (+bothArg ? [P.toMove, 3 - P.toMove] : [P.toMove])) {
     E.setBoard(P.board);

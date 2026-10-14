@@ -333,6 +333,7 @@
   let clickAttempts = 0;
   let lastClickAt = 0;
   let pendingClickKey = null; // position for which a delayed auto-click is scheduled
+  let pendingToken = null;    // identifies the tick that owns pendingClickKey
   let timer = null;
 
   function invalidate() { lastKey = ''; lastResult = null; clickAttempts = 0; }
@@ -346,9 +347,10 @@
 
   function formatScore(r) {
     const W = 1000000;
-    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + (W - r.score) + ' 手内';
-    if (r.score <= -(W - 200)) return '对方有杀';
+    if (r.reason === 'win') return '成五获胜';
     if (r.reason === 'lost') return '对方必胜（无合法防点）';
+    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + Math.max(1, W - r.score) + ' 手内';
+    if (r.score <= -(W - 200)) return '对方有杀';
     if (r.reason === 'block-four') return '挡冲四';
     if (r.reason === 'opening') return '开局';
     const s = Math.max(-9999, Math.min(9999, Math.round(r.score / 10)));
@@ -410,7 +412,9 @@
     showHint(now, res.move, res.pv, settings.mode === 'auto');
 
     if (settings.mode === 'auto') {
+      const myToken = {};
       pendingClickKey = st.key;
+      pendingToken = myToken;
       try {
         const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
         await sleep(delay);
@@ -419,7 +423,8 @@
         clickAttempts = 1;
         await placeMove(again, res.move);
       } finally {
-        pendingClickKey = null;
+        // only clear our own marker: a newer tick may have started its own delay
+        if (pendingToken === myToken) { pendingClickKey = null; pendingToken = null; }
       }
     }
   }

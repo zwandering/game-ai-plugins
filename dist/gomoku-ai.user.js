@@ -195,6 +195,12 @@ function createGomokuEngine() {
       this.catCount = new Int32Array(2 * 5);
       this.total = new Int32Array(2);
       this.nb = new Uint8Array(N);                // stones within distance 2
+      // Renju black cells whose only problem is a table double three: they may be
+      // legal (one three can be fake), so cat[] treats them as forbidden (keeps all
+      // catCount shortcuts conservative) and mfCat[] keeps their would-be category.
+      // Threat code uses them only after an exact isForbidden() check.
+      this.mfCat = new Uint8Array(N);
+      this.mfCount = 0;                           // cells with mfCat >= CAT_FOUR
       this.stones = 0;
       this.hashLo = 0; this.hashHi = 0;
       this.history = [];
@@ -228,7 +234,7 @@ function createGomokuEngine() {
 
     reset() {
       this.board.fill(0); this.shape.fill(0); this.score.fill(0); this.cat.fill(0);
-      this.catCount.fill(0); this.total.fill(0); this.nb.fill(0);
+      this.catCount.fill(0); this.total.fill(0); this.nb.fill(0); this.mfCat.fill(0); this.mfCount = 0;
       this.stones = 0; this.hashLo = 0; this.hashHi = 0; this.history.length = 0;
       this.catCount[0 * 5 + CAT_NONE] = N; this.catCount[1 * 5 + CAT_NONE] = N;
       // Shapes of an empty board are not all S_NONE near the edges, compute them.
@@ -283,7 +289,7 @@ function createGomokuEngine() {
       for (let ci = 0; ci < 2; ci++) {
         const sIdx = ci * N + q;
         const oldScore = this.score[sIdx], oldCat = this.cat[sIdx];
-        let score = 0, cat = CAT_NONE;
+        let score = 0, cat = CAT_NONE, mf = 0;
         if (this.board[q] === EMPTY) {
           let fours = 0, openThrees = 0, five = false, openFour = false, overline = false;
           for (let d = 0; d < 4; d++) {
@@ -297,13 +303,24 @@ function createGomokuEngine() {
             else if (s === S_OPEN_THREE) openThrees++;
           }
           if (five) { cat = CAT_FIVE; }
-          else if (renju && ci === 0 && (overline || fours >= 2 || openThrees >= 2)) { score = 0; cat = CAT_NONE; } // forbidden for black (double three re-checked exactly in isForbidden)
+          else if (renju && ci === 0 && (overline || fours >= 2 || openThrees >= 2)) {
+            // forbidden for black (a double three is only "maybe": see mfCat)
+            if (!overline && fours < 2) mf = openFour ? CAT_WIN2 : (fours >= 1 ? CAT_FOUR : CAT_OPEN_THREE);
+            score = 0; cat = CAT_NONE;
+          }
           else if (openFour || fours >= 2) { cat = CAT_WIN2; if (fours >= 2) score += BONUS_DOUBLE_FOUR; }
           else if (fours >= 1) { cat = CAT_FOUR; if (openThrees >= 1) score += BONUS_FOUR_THREE; }
           else if (openThrees >= 1) { cat = CAT_OPEN_THREE; if (openThrees >= 2) score += BONUS_DOUBLE_THREE; }
         }
         if (score !== oldScore) { this.total[ci] += score - oldScore; this.score[sIdx] = score; }
         if (cat !== oldCat) { this.catCount[ci * 5 + oldCat]--; this.catCount[ci * 5 + cat]++; this.cat[sIdx] = cat; }
+        if (ci === 0) {
+          const oldMf = this.mfCat[q];
+          if (mf !== oldMf) {
+            this.mfCount += (mf >= CAT_FOUR ? 1 : 0) - (oldMf >= CAT_FOUR ? 1 : 0);
+            this.mfCat[q] = mf;
+          }
+        }
       }
     }
 
@@ -371,7 +388,7 @@ function createGomokuEngine() {
       }
       if (fours >= 2) return true;
       if (threes < 2) return false;
-      if (depth >= 2) return true; // deep enough: treat threes as real
+      if (depth >= 30) return true; // safety bound only: each level adds a stone, so recursion ends anyway
       // Verify each three: after p, some empty point on that line must make a
       // straight four and not be forbidden itself.
       this.play(p, BLACK);
@@ -382,11 +399,31 @@ function createGomokuEngine() {
         for (let i = 0; i < K; i++) {
           const x = NBR[base + i];
           if (x < 0 || this.board[x] !== EMPTY) continue;
-          if (shape[d * N + x] === S_OPEN_FOUR && !this.isForbidden(x, depth + 1)) { real++; break; }
+          if (shape[d * N + x] !== S_OPEN_FOUR) continue;
+          // the straight four must contain p: every cell strictly between p and x is black
+          const off = i < W ? i - W : i - W + 1;
+          let contig = true;
+          for (let j = 1; j < Math.abs(off); j++) {
+            const y = NBR[base + (off < 0 ? W - j : W - 1 + j)];
+            if (this.board[y] !== BLACK) { contig = false; break; }
+          }
+          if (contig && !this.isForbidden(x, depth + 1)) { real++; break; }
         }
       }
       this.undo();
       return real >= 2;
+    }
+
+    /** Renju black: a "maybe forbidden" cell that is in fact legal, with category >= minCat. */
+    mfLegal(p, minCat) {
+      return this.mfCat[p] >= minCat && !this.isForbidden(p);
+    }
+
+    /** Can colour c make a four (or better) somewhere, including maybe-forbidden black cells? */
+    hasFourMove(c) {
+      const ci = c - 1;
+      return this.catCount[ci * 5 + CAT_FOUR] > 0 || this.catCount[ci * 5 + CAT_WIN2] > 0 ||
+        (c === BLACK && this.rule === 'renju' && this.mfCount > 0);
     }
 
     legal(p, c) {
@@ -454,7 +491,7 @@ function createGomokuEngine() {
         if (!blocks && renjuWhite) {
           for (let d = 0; d < 4; d++) { const sh = shape[d * N + p]; if (sh >= S_FOUR) { blocks = true; break; } }
         }
-        if (cm >= CAT_FOUR || blocks) {
+        if (cm >= CAT_FOUR || blocks || (renjuBlack && this.mfCat[p] >= CAT_FOUR)) {
           if (renjuBlack && cm === CAT_NONE && this.isForbidden(p)) continue;
           buf[n++] = (this.score[mi * N + p] * 11 + this.score[oi * N + p] * 10) * 256 + p;
         }
@@ -530,13 +567,14 @@ function createGomokuEngine() {
       }
       const rem = maxPly - (ply - rootPly);
       if (rem <= 0 || this.vcfNodes <= 0) return 0;
-      if (this.catCount[mi * 5 + CAT_FOUR] === 0) return 0;
+      const mfBlack = me === BLACK && this.rule === 'renju' && this.mfCount > 0;
+      if (this.catCount[mi * 5 + CAT_FOUR] === 0 && !mfBlack) return 0;
       const key = this.posKey(me);
       const failed = this.vcfFail.get(key);
       if (failed !== undefined && failed >= rem) return 0;
       // Snapshot the four-making cells first: play() mutates categories.
       const base = mi * N, list = [];
-      for (let p = 0; p < N; p++) if (this.cat[base + p] === CAT_FOUR) list.push(p);
+      for (let p = 0; p < N; p++) if (this.cat[base + p] === CAT_FOUR || (mfBlack && this.mfLegal(p, CAT_FOUR))) list.push(p);
       if (list.length > 1) list.sort((a, b) => this.score[base + b] - this.score[base + a]);
       for (let i = 0; i < list.length; i++) {
         const p = list[i];
@@ -622,7 +660,7 @@ function createGomokuEngine() {
       if (failed !== undefined && failed >= rem) return 0;
 
       // Continuous fours alone may already win.
-      if (this.catCount[mi * 5 + CAT_FOUR] > 0) {
+      if (this.hasFourMove(me)) {
         this.vcfNodes = 400; this.vcfMove = -1; this.vcfDeadline = this.vctDeadline;
         const f = this.vcf(me, ply, rem, ply);
         if (f) {
@@ -637,6 +675,7 @@ function createGomokuEngine() {
       for (let p = 0; p < N; p++) {
         const c = this.cat[base + p];
         if (c === CAT_FOUR || c === CAT_OPEN_THREE) list.push(p);
+        else if (me === BLACK && this.mfCat[p] && this.board[p] === EMPTY && this.mfLegal(p, CAT_OPEN_THREE)) list.push(p);
       }
       if (list.length === 0) return 0;
       list.sort((a, b) => (this.score[base + b] * 2 + this.score[oi * N + b]) - (this.score[base + a] * 2 + this.score[oi * N + a]));
@@ -870,7 +909,7 @@ function createGomokuEngine() {
       // time re-finding it so the attack is not dropped halfway.
       const wasWinning = this.winning;
       this.winning = false;
-      const oppVcf = (this.catCount[oi * 5 + CAT_FOUR] > 0 || this.catCount[oi * 5 + CAT_WIN2] > 0)
+      const oppVcf = this.hasFourMove(opp)
         ? this.findVcf(opp, 60000, 30, now() + timeMs * 0.1) : null;
       mark('oppVcf');
       // (Sound even when the opponent has threats of its own: the VCT tree lets the
@@ -893,7 +932,10 @@ function createGomokuEngine() {
         const cands = [];
         for (let i = 0; i < n; i++) cands.push(this.candBuf[0][i] % 256);
         // also every move that makes a four (forcing replies)
-        for (let p = 0; p < N; p++) if (this.cat[mi * N + p] >= CAT_FOUR && cands.indexOf(p) < 0) cands.push(p);
+        for (let p = 0; p < N; p++) {
+          if (cands.indexOf(p) >= 0 || this.board[p] !== EMPTY) continue;
+          if (this.cat[mi * N + p] >= CAT_FOUR || (me === BLACK && this.rule === 'renju' && this.mfLegal(p, CAT_FOUR))) cands.push(p);
+        }
         const t1 = now(), budget = timeMs * 0.15;
         for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
           if (!this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget)) safe.add(cands[i]);
@@ -1351,6 +1393,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   let clickAttempts = 0;
   let lastClickAt = 0;
   let pendingClickKey = null; // position for which a delayed auto-click is scheduled
+  let pendingToken = null;    // identifies the tick that owns pendingClickKey
   let timer = null;
 
   function invalidate() { lastKey = ''; lastResult = null; clickAttempts = 0; }
@@ -1364,9 +1407,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
 
   function formatScore(r) {
     const W = 1000000;
-    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + (W - r.score) + ' 手内';
-    if (r.score <= -(W - 200)) return '对方有杀';
+    if (r.reason === 'win') return '成五获胜';
     if (r.reason === 'lost') return '对方必胜（无合法防点）';
+    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + Math.max(1, W - r.score) + ' 手内';
+    if (r.score <= -(W - 200)) return '对方有杀';
     if (r.reason === 'block-four') return '挡冲四';
     if (r.reason === 'opening') return '开局';
     const s = Math.max(-9999, Math.min(9999, Math.round(r.score / 10)));
@@ -1428,7 +1472,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     showHint(now, res.move, res.pv, settings.mode === 'auto');
 
     if (settings.mode === 'auto') {
+      const myToken = {};
       pendingClickKey = st.key;
+      pendingToken = myToken;
       try {
         const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
         await sleep(delay);
@@ -1437,7 +1483,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         clickAttempts = 1;
         await placeMove(again, res.move);
       } finally {
-        pendingClickKey = null;
+        // only clear our own marker: a newer tick may have started its own delay
+        if (pendingToken === myToken) { pendingClickKey = null; pendingToken = null; }
       }
     }
   }
