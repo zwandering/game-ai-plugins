@@ -185,7 +185,7 @@
   .gai-hint-pv{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font:600 11px/1 system-ui,sans-serif;
     color:#fff;background:rgba(0,0,0,.55);border-radius:8px;padding:2px 4px;pointer-events:none;z-index:29}
   @keyframes gai-pulse{0%,100%{opacity:1}50%{opacity:.45}}
-  #gai-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:236px;background:#1f2430;color:#e9edf3;
+  #gai-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:264px;background:#1f2430;color:#e9edf3;
     border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.35);font:13px/1.45 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
     user-select:none}
   #gai-panel *{box-sizing:border-box}
@@ -198,7 +198,7 @@
   #gai-panel button:hover{background:#364055}
   #gai-panel .gai-body{padding:8px 10px 10px}
   #gai-panel .gai-seg{display:flex;gap:4px;margin-bottom:8px}
-  #gai-panel .gai-seg button{flex:1}
+  #gai-panel .gai-seg button{flex:1;white-space:nowrap;padding:3px 4px}
   #gai-panel .gai-seg button.active{background:#1c7ed6;border-color:#1c7ed6;color:#fff}
   #gai-panel .gai-row{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:4px 0}
   #gai-panel input[type=range]{width:120px}
@@ -272,7 +272,7 @@
   }
 
   function placePanel(x, y) {
-    const w = panel.offsetWidth || 236, h = panel.offsetHeight || 200;
+    const w = panel.offsetWidth || 264, h = panel.offsetHeight || 200;
     x = Math.max(0, Math.min(window.innerWidth - w, x));
     y = Math.max(0, Math.min(window.innerHeight - 40, y));
     panel.style.left = x + 'px'; panel.style.top = y + 'px';
