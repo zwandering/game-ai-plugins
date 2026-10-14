@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gomoku AI 助手 (gomoku.com)
 // @namespace    https://github.com/local/gomoku-ai-plugin
-// @version      1.3.0
+// @version      1.4.0
 // @description  为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。
 // @match        https://gomoku.com/*
 // @match        https://www.gomoku.com/*
@@ -1276,7 +1276,13 @@ function createGomokuEngine() {
             });
             post({ id: msg.id, ok: true, result: { done: true } });
           } else if (msg.type === 'evalMove') {
-            const r = engine.evalMove(msg.color, idx(msg.row, msg.col), msg.timeMs);
+            const p = idx(msg.row, msg.col);
+            const r = engine.evalMove(msg.color, p, msg.timeMs);
+            // optional: the expected continuation if this move is played (hover preview)
+            if (msg.line && r.legal) {
+              const pl = engine.principalLine(msg.color, p, msg.plies || 8, msg.pvMs || 80);
+              r.line = { moves: pl.moves.map(rc), winner: pl.winner };
+            }
             post({ id: msg.id, ok: true, result: Object.assign(r, { move: cell(r.move) }) });
           } else {
             const r = engine.evalPosition(msg.color, msg.timeMs);
@@ -1605,14 +1611,18 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const auto = settings.mode === 'auto';
     const opp = a.side === 'opp';
     const cellAt = (rc) => st.cells.get(rc.row * SIZE + rc.col);
+    // While a cell is hovered, its own continuation is shown instead of the
+    // recommended one (and the heat map is hidden to keep the board readable).
+    const pre = preview && preview.key === a.key && preview.line && preview.line.moves.length > 1 ? preview.line : null;
+    const line = pre || a.pv;
     // continuation (ghost stones), drawn first so the hint ring sits on top
     const ghostCells = new Set();
-    if (settings.showPv && !auto && a.pv && a.pv.moves.length > 1) {
+    if (!auto && line && line.moves.length > 1 && (pre || settings.showPv)) {
       let c = a.color || st.myColor;
-      a.pv.moves.forEach((rc, i) => {
+      line.moves.forEach((rc, i) => {
         const cell = cellAt(rc);
         if (cell && st.board[rc.row][rc.col] === 0) {
-          const last = i === a.pv.moves.length - 1 && a.pv.winner;
+          const last = i === line.moves.length - 1 && line.winner;
           addOverlay(cell, 'gai-ghost ' + (c === 1 ? 'b' : 'w') + (last ? ' end' : ''), String(i + 1));
           ghostCells.add(rc.row * SIZE + rc.col);
         }
@@ -1620,7 +1630,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       });
     }
     // heat map: win rate after each candidate move
-    if (settings.showHeat && !auto && a.moves) {
+    if (settings.showHeat && !auto && a.moves && !pre) {
       a.moves.forEach((m, i) => {
         const cell = st.cells.get(m.row * SIZE + m.col);
         // cells showing a continuation stone keep only its number (hover shows the value)
@@ -1853,8 +1863,24 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   }
 
   // ------------------------------------------------------------------ hover: win rate of any empty cell
-  const hoverCache = new Map(); // key + '|' + cell -> result
+  const hoverCache = new Map(); // key + '|' + cell -> result (value and continuation)
   let hoverCell = null, hoverTimer = null, hoverBoardEl = null;
+  let preview = null;           // { key, rc, line } : continuation shown for the hovered cell
+
+  /** Analysis object for the side to move in the current position, if any. */
+  function currentAnalysis() {
+    const st = lastState;
+    const a = st && (st.myTurn ? analysis : oppAnalysis);
+    return a && a.key === st.key ? a : null;
+  }
+  function setPreview(p) {
+    preview = p;
+    const a = currentAnalysis();
+    if (a && lastState) drawOverlays(lastState, a);
+    if (!p && a && a.pv && a.pv.moves.length > 1) {
+      ui.info.textContent = (a.side === 'opp' ? '对方后续: ' : '后续: ') + a.pv.moves.map(cellName).join(' ') + (a.pv.winner ? '（' + colorName(a.pv.winner) + '胜）' : '');
+    }
+  }
 
   function attachHover(boardEl) {
     if (hoverBoardEl === boardEl) return;
@@ -1865,7 +1891,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       hoverCell = cell;
       showHover(cell);
     });
-    boardEl.addEventListener('mouseleave', () => { hoverCell = null; ui.hover.textContent = ' '; });
+    boardEl.addEventListener('mouseleave', () => {
+      hoverCell = null; ui.hover.textContent = ' ';
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+      if (preview) setPreview(null);
+    });
   }
 
   function showHover(cell) {
@@ -1876,8 +1906,19 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const a = st && (st.myTurn ? analysis : oppAnalysis);
     if (!st || !a || a.key !== st.key || settings.mode === 'off' || st.board[r][c]) {
       ui.hover.textContent = ' ';
+      if (preview) setPreview(null);
       return;
     }
+    const lineText = (ln) => (ln && ln.moves.length > 1)
+      ? (a.side === 'opp' ? '若对方下 ' : '若下 ') + name + ' 后续: ' + ln.moves.map(cellName).join(' ') + (ln.winner ? '（' + colorName(ln.winner) + '胜）' : '')
+      : '';
+    // the recommended move already has its continuation
+    const isBest = a.best && a.best.move && a.best.move.row === r && a.best.move.col === c;
+    const showLine = (ln) => {
+      if (settings.mode === 'auto') return;
+      setPreview(ln ? { key: st.key, rc: { row: r, col: c }, line: ln } : null);
+      if (ln && ln.moves.length > 1) ui.info.textContent = lineText(ln);
+    };
     const opp = a.side === 'opp';
     const base = a.positionWin;
     const show = (win, note, score) => {
@@ -1889,16 +1930,19 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         : `若下 ${name}：我方胜率 ${pct(win)}${delta}${forced}${note || ''}`;
     };
     const m = a.moves && a.moves.find(x => x.row === r && x.col === c);
-    if (m) { show(m.win, '', m.score); return; }
     const hk = st.key + '|' + r + ',' + c;
-    if (hoverCache.has(hk)) {
-      const h = hoverCache.get(hk);
-      if (h.legal === false) show(null, '禁手/不可下'); else show(h.win, '', h.score);
+    const cached = hoverCache.get(hk);
+    if (isBest && a.pv) { if (m) show(m.win, '', m.score); showLine(a.pv); return; }
+    if (cached) {
+      if (cached.legal === false) { show(null, '禁手/不可下'); showLine(null); }
+      else { show(m ? m.win : cached.win, '', m ? m.score : cached.score); showLine(cached.line); }
       return;
     }
-    show(null, '计算中…');
+    if (m) show(m.win, '（正在推演后续…）', m.score); else show(null, '计算中…');
+    showLine(null);
     hoverTimer = setTimeout(() => {
-      request({ type: 'evalMove', board: st.board, color: a.color || st.myColor, rule: st.rule, row: r, col: c, timeMs: 350, key: st.key }, null, 350)
+      request({ type: 'evalMove', board: st.board, color: a.color || st.myColor, rule: st.rule, row: r, col: c, timeMs: 350, key: st.key,
+        line: true, plies: 8, pvMs: Math.max(60, Math.min(150, Math.round(settings.thinkMs / 15))) }, null, 2000)
         .then((res) => {
           hoverCache.set(hk, res);
           if (hoverCell === cell && lastState && lastState.key === st.key) showHover(cell);
@@ -2006,6 +2050,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const wantAnalysis = !auto && (settings.showHeat || settings.showPv);
     busy = true; renderSettings();
     lastKey = st.key; clickAttempts = 0;
+    preview = null;
     const a = { key: st.key, side: 'me', color: st.myColor, best: null, moves: null, positionWin: undefined, pv: null, done: false };
     analysis = a;
     clearOverlays();
@@ -2119,6 +2164,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const opp = 3 - st.myColor;
     if (settings.mode === 'hint' && settings.showOpp) {
       const thinkMs = settings.thinkMs;
+      preview = null;
       const oa = { key: st.key, side: 'opp', color: opp, best: null, moves: null, positionWin: undefined, pv: null, done: false };
       oppAnalysis = oa;
       const current = () => oppAnalysis === oa && lastState && lastState.key === oa.key && !lastState.myTurn;
@@ -2224,7 +2270,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.3.0',
+    readState, setMode, settings, version: '1.4.0',
     debug: () => ({ analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

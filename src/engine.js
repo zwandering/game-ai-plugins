@@ -1266,7 +1266,13 @@ function createGomokuEngine() {
             });
             post({ id: msg.id, ok: true, result: { done: true } });
           } else if (msg.type === 'evalMove') {
-            const r = engine.evalMove(msg.color, idx(msg.row, msg.col), msg.timeMs);
+            const p = idx(msg.row, msg.col);
+            const r = engine.evalMove(msg.color, p, msg.timeMs);
+            // optional: the expected continuation if this move is played (hover preview)
+            if (msg.line && r.legal) {
+              const pl = engine.principalLine(msg.color, p, msg.plies || 8, msg.pvMs || 80);
+              r.line = { moves: pl.moves.map(rc), winner: pl.winner };
+            }
             post({ id: msg.id, ok: true, result: Object.assign(r, { move: cell(r.move) }) });
           } else {
             const r = engine.evalPosition(msg.color, msg.timeMs);
