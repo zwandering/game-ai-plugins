@@ -160,10 +160,13 @@ function boardText(board, mark) {
 }
 
 // --opp engine:<ms> replaces the baseline by a second engine instance with a longer think time (to expose horizon blunders)
-const OPP_MS = (() => { const o = arg("opp", "baseline"); return o.startsWith("engine:") ? +o.slice(7) : 0; })();
+// --opp v1:<ms> uses the previous engine version (test/engine-v1.js) instead.
+const OPP_SPEC = arg("opp", "baseline");
+const OPP_MS = (() => { const m = /^(engine|v1):(\d+)$/.exec(OPP_SPEC); return m ? +m[2] : 0; })();
+const OppEngine = OPP_SPEC.startsWith('v1:') ? require('./engine-v1.js')().Engine : Engine;
 let oppEngine = null;
 function playGame(gi, rule, timeMs, baseSeed, engine, oracle) {
-  if (OPP_MS > 0 && (!oppEngine || oppEngine.rule !== rule)) oppEngine = new Engine({ rule });
+  if (OPP_MS > 0 && (!oppEngine || oppEngine.rule !== rule)) oppEngine = new OppEngine({ rule });
   const seed = baseSeed + gi;
   const rnd = mulberry32(seed);
   const engineColor = gi % 2 === 0 ? 1 : 2;
@@ -213,13 +216,15 @@ function playGame(gi, rule, timeMs, baseSeed, engine, oracle) {
 
 function summarise(games) {
   const by = { 1: { w: 0, l: 0, d: 0 }, 2: { w: 0, l: 0, d: 0 } };
+  // soundness: games where the engine claimed a forced win but did not win
+  const falseWins = games.filter(g => !g.engineWon && g.moves.some(m => m.who === 'engine' && m.info && m.info.score >= 999800)).map(g => g.gi);
   let tsum = 0, tn = 0, tmax = 0, over = 0;
   for (const g of games) {
     const s = by[g.engineColor];
     if (g.draw) s.d++; else if (g.engineWon) s.w++; else s.l++;
     for (const t of g.engTimes) { tsum += t; tn++; tmax = Math.max(tmax, t); if (t > 330) over++; }
   }
-  return { engineAsBlack: by[1], engineAsWhite: by[2], avgThinkMs: +(tsum / Math.max(1, tn)).toFixed(1), maxThinkMs: tmax, movesOver110pct: over, engineMoves: tn };
+  return { engineAsBlack: by[1], engineAsWhite: by[2], falseWinClaims: falseWins, avgThinkMs: +(tsum / Math.max(1, tn)).toFixed(1), maxThinkMs: tmax, movesOver110pct: over, engineMoves: tn };
 }
 
 function mainPlay() {

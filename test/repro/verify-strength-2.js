@@ -3,7 +3,7 @@
 // Loads src/engine.js in memory, instruments the iterative-deepening loop (no file edits).
 //   node test/verify-strength-2.js [timeMs=300] [gamesPerRule=4]     (env STOPF=0.6 to change the stop factor)
 const fs = require('fs'), path = require('path');
-const src0 = fs.readFileSync(path.join(__dirname, '../src/engine.js'), 'utf8');
+const src0 = fs.readFileSync(path.join(__dirname, '../../src/engine.js'), 'utf8');
 function load(src) { const m = { exports: {} }; new Function('module', 'require', 'process', src)(m, require, process); return m.exports(); }
 const LOOP_OLD = "const s = this.negamax(me, depth, -INF, INF, 0, 3);";
 const LOOP_NEW = "const __ts = now(); const s = this.negamax(me, depth, -INF, INF, 0, 3); (this.__iters = this.__iters || []).push({ depth, ms: now() - __ts, at: now() - t0, aborted: this.aborted, rb: this.rootBest });";

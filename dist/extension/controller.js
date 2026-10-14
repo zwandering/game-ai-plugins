@@ -185,7 +185,7 @@
   .gai-hint-pv{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font:600 11px/1 system-ui,sans-serif;
     color:#fff;background:rgba(0,0,0,.55);border-radius:8px;padding:2px 4px;pointer-events:none;z-index:29}
   @keyframes gai-pulse{0%,100%{opacity:1}50%{opacity:.45}}
-  #gai-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:236px;background:#1f2430;color:#e9edf3;
+  #gai-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:264px;background:#1f2430;color:#e9edf3;
     border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.35);font:13px/1.45 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
     user-select:none}
   #gai-panel *{box-sizing:border-box}
@@ -198,7 +198,7 @@
   #gai-panel button:hover{background:#364055}
   #gai-panel .gai-body{padding:8px 10px 10px}
   #gai-panel .gai-seg{display:flex;gap:4px;margin-bottom:8px}
-  #gai-panel .gai-seg button{flex:1}
+  #gai-panel .gai-seg button{flex:1;white-space:nowrap;padding:3px 4px}
   #gai-panel .gai-seg button.active{background:#1c7ed6;border-color:#1c7ed6;color:#fff}
   #gai-panel .gai-row{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:4px 0}
   #gai-panel input[type=range]{width:120px}
@@ -272,7 +272,7 @@
   }
 
   function placePanel(x, y) {
-    const w = panel.offsetWidth || 236, h = panel.offsetHeight || 200;
+    const w = panel.offsetWidth || 264, h = panel.offsetHeight || 200;
     x = Math.max(0, Math.min(window.innerWidth - w, x));
     y = Math.max(0, Math.min(window.innerHeight - 40, y));
     panel.style.left = x + 'px'; panel.style.top = y + 'px';
@@ -331,6 +331,8 @@
   let lastKey = '';          // position key we already handled
   let lastResult = null;     // { key, result }
   let clickAttempts = 0;
+  let lastClickAt = 0;
+  let pendingClickKey = null; // position for which a delayed auto-click is scheduled
   let timer = null;
 
   function invalidate() { lastKey = ''; lastResult = null; clickAttempts = 0; }
@@ -344,8 +346,9 @@
 
   function formatScore(r) {
     const W = 1000000;
-    if (r.score >= W - 200) return '必胜 (' + (W - r.score) + ' 手内)';
+    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + (W - r.score) + ' 手内';
     if (r.score <= -(W - 200)) return '对方有杀';
+    if (r.reason === 'lost') return '对方必胜（无合法防点）';
     if (r.reason === 'block-four') return '挡冲四';
     if (r.reason === 'opening') return '开局';
     const s = Math.max(-9999, Math.min(9999, Math.round(r.score / 10)));
@@ -357,7 +360,7 @@
     const st = readState();
     if (!st) { clearHint(); setStatus('未检测到对局棋盘', ''); return; }
     if (settings.mode === 'off') { clearHint(); setStatus('已关闭', ''); return; }
-    if (st.gameOver) { clearHint(); setStatus('对局结束', ''); return; }
+    if (st.gameOver) { clearHint(); invalidate(); setStatus('对局结束', ''); return; }
     if (st.notStarted) { clearHint(); setStatus('请选择难度开始游戏', ''); return; }
     if (!st.myColor) { clearHint(); setStatus('无法识别我方棋色', ''); return; }
     if (st.toMove === 0) { setWarn('棋子数量异常（黑' + st.black + ' 白' + st.white + '），等待同步'); return; }
@@ -368,8 +371,13 @@
       return;
     }
     if (st.key === lastKey && !force) {
-      // Already handled this position. In auto mode, retry the click if it did not land.
-      if (settings.mode === 'auto' && lastResult && lastResult.key === st.key && clickAttempts < 3) {
+      // Already handled this position: redraw the hint if it got lost (e.g. a rejected move).
+      if (lastResult && lastResult.key === st.key && !hintEls.some(e => e.isConnected)) {
+        showHint(st, lastResult.result.move, lastResult.result.pv, settings.mode === 'auto');
+      }
+      // In auto mode, retry the click if it did not land (but never during the planned delay).
+      if (settings.mode === 'auto' && lastResult && lastResult.key === st.key && clickAttempts < 3 &&
+          pendingClickKey !== st.key && Date.now() - lastClickAt > 2500) {
         clickAttempts++;
         await placeMove(st, lastResult.result.move);
       }
@@ -402,12 +410,17 @@
     showHint(now, res.move, res.pv, settings.mode === 'auto');
 
     if (settings.mode === 'auto') {
-      const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
-      await sleep(delay);
-      const again = readState();
-      if (!again || again.key !== st.key || !again.myTurn || settings.mode !== 'auto') return;
-      clickAttempts = 1;
-      await placeMove(again, res.move);
+      pendingClickKey = st.key;
+      try {
+        const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
+        await sleep(delay);
+        const again = readState();
+        if (!again || again.key !== st.key || !again.myTurn || settings.mode !== 'auto') return;
+        clickAttempts = 1;
+        await placeMove(again, res.move);
+      } finally {
+        pendingClickKey = null;
+      }
     }
   }
 
@@ -417,6 +430,7 @@
     const cell = st.cells.get(move.row * SIZE + move.col);
     if (!cell || st.board[move.row][move.col] !== 0) return;
     clearHint();
+    lastClickAt = Date.now();
     cell.click();
     // Small screens use "tap to preview, tap again to confirm".
     await sleep(120);
@@ -436,13 +450,18 @@
           const own = [...m.addedNodes, ...m.removedNodes].every(n => n.nodeType === 1 && n.classList && n.classList.contains('gai-hint'));
           if (own) continue;
         }
-        schedule(150);
+        // Throttle: never push back a tick that is already pending, so a page
+        // element that changes very often cannot starve the controller.
+        if (!timer) schedule(150);
         return;
       }
     });
     mo.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'], characterData: true });
     setInterval(() => schedule(0), 2000);
     document.addEventListener('keydown', (e) => {
+      if (e.repeat || e.isComposing) return;
+      const t = (e.composedPath && e.composedPath()[0]) || e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return; // typing (e.g. chat)
       if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 'a' || e.key === 'A' || e.code === 'KeyA')) {
         e.preventDefault();
         setMode(settings.mode === 'auto' ? 'hint' : 'auto');
@@ -451,7 +470,7 @@
     schedule(300);
   }
 
-  window.__gomokuAI = { readState, think, setMode, settings, version: '1.0.0' };
+  window.__gomokuAI = { readState, think, setMode, settings, version: '1.1.0' };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();

@@ -332,6 +332,7 @@
   let lastResult = null;     // { key, result }
   let clickAttempts = 0;
   let lastClickAt = 0;
+  let pendingClickKey = null; // position for which a delayed auto-click is scheduled
   let timer = null;
 
   function invalidate() { lastKey = ''; lastResult = null; clickAttempts = 0; }
@@ -345,8 +346,9 @@
 
   function formatScore(r) {
     const W = 1000000;
-    if (r.score >= W - 200) return '必胜 (' + (W - r.score) + ' 手内)';
+    if (r.score >= W - 200) return '必胜' + (r.reason === 'vct' ? '（连续冲四/活三）' : r.reason === 'vcf' ? '（连续冲四）' : '') + '，' + (W - r.score) + ' 手内';
     if (r.score <= -(W - 200)) return '对方有杀';
+    if (r.reason === 'lost') return '对方必胜（无合法防点）';
     if (r.reason === 'block-four') return '挡冲四';
     if (r.reason === 'opening') return '开局';
     const s = Math.max(-9999, Math.min(9999, Math.round(r.score / 10)));
@@ -358,7 +360,7 @@
     const st = readState();
     if (!st) { clearHint(); setStatus('未检测到对局棋盘', ''); return; }
     if (settings.mode === 'off') { clearHint(); setStatus('已关闭', ''); return; }
-    if (st.gameOver) { clearHint(); setStatus('对局结束', ''); return; }
+    if (st.gameOver) { clearHint(); invalidate(); setStatus('对局结束', ''); return; }
     if (st.notStarted) { clearHint(); setStatus('请选择难度开始游戏', ''); return; }
     if (!st.myColor) { clearHint(); setStatus('无法识别我方棋色', ''); return; }
     if (st.toMove === 0) { setWarn('棋子数量异常（黑' + st.black + ' 白' + st.white + '），等待同步'); return; }
@@ -369,9 +371,13 @@
       return;
     }
     if (st.key === lastKey && !force) {
-      // Already handled this position. In auto mode, retry the click if it did not land.
+      // Already handled this position: redraw the hint if it got lost (e.g. a rejected move).
+      if (lastResult && lastResult.key === st.key && !hintEls.some(e => e.isConnected)) {
+        showHint(st, lastResult.result.move, lastResult.result.pv, settings.mode === 'auto');
+      }
+      // In auto mode, retry the click if it did not land (but never during the planned delay).
       if (settings.mode === 'auto' && lastResult && lastResult.key === st.key && clickAttempts < 3 &&
-          Date.now() - lastClickAt > 2500) {
+          pendingClickKey !== st.key && Date.now() - lastClickAt > 2500) {
         clickAttempts++;
         await placeMove(st, lastResult.result.move);
       }
@@ -404,12 +410,17 @@
     showHint(now, res.move, res.pv, settings.mode === 'auto');
 
     if (settings.mode === 'auto') {
-      const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
-      await sleep(delay);
-      const again = readState();
-      if (!again || again.key !== st.key || !again.myTurn || settings.mode !== 'auto') return;
-      clickAttempts = 1;
-      await placeMove(again, res.move);
+      pendingClickKey = st.key;
+      try {
+        const delay = settings.delayMs ? settings.delayMs * (0.6 + Math.random() * 0.8) : 0;
+        await sleep(delay);
+        const again = readState();
+        if (!again || again.key !== st.key || !again.myTurn || settings.mode !== 'auto') return;
+        clickAttempts = 1;
+        await placeMove(again, res.move);
+      } finally {
+        pendingClickKey = null;
+      }
     }
   }
 
@@ -439,13 +450,18 @@
           const own = [...m.addedNodes, ...m.removedNodes].every(n => n.nodeType === 1 && n.classList && n.classList.contains('gai-hint'));
           if (own) continue;
         }
-        schedule(150);
+        // Throttle: never push back a tick that is already pending, so a page
+        // element that changes very often cannot starve the controller.
+        if (!timer) schedule(150);
         return;
       }
     });
     mo.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'], characterData: true });
     setInterval(() => schedule(0), 2000);
     document.addEventListener('keydown', (e) => {
+      if (e.repeat || e.isComposing) return;
+      const t = (e.composedPath && e.composedPath()[0]) || e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return; // typing (e.g. chat)
       if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 'a' || e.key === 'A' || e.code === 'KeyA')) {
         e.preventDefault();
         setMode(settings.mode === 'auto' ? 'hint' : 'auto');
@@ -454,7 +470,7 @@
     schedule(300);
   }
 
-  window.__gomokuAI = { readState, think, setMode, settings, version: '1.0.0' };
+  window.__gomokuAI = { readState, think, setMode, settings, version: '1.1.0' };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();

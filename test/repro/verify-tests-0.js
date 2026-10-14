@@ -1,4 +1,4 @@
-const src=require('fs').readFileSync(__dirname+'/../src/engine.js','utf8');
+const src=require('fs').readFileSync(__dirname+'/../../src/engine.js','utf8');
 let G; try{G=require('../../src/engine.js');}catch(e){}
 const create=(G&&G.createGomokuEngine)||(typeof G==='function'?G:null)||new Function(src+';return createGomokuEngine;')();
 const {Engine,BLACK,WHITE}=create();

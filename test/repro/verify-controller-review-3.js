@@ -1,6 +1,6 @@
 // Extracts the keydown handler body from src/controller.js:448-453 and feeds a macOS Option+A event from an <input>.
 const fs = require('fs');
-const src = fs.readFileSync(__dirname + '/../src/controller.js', 'utf8');
+const src = fs.readFileSync(__dirname + '/../../src/controller.js', 'utf8');
 const m = src.match(/document\.addEventListener\('keydown', \(e\) => \{([\s\S]*?)\n    \}\);/);
 if (!m) throw new Error('handler not found');
 let mode = 'hint', prevented = 0;

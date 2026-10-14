@@ -2,7 +2,7 @@
 // Engine (0.4 stop rule, unmodified) vs engine with the stop factor replaced by F (in-memory patch).
 //   node test/verify-strength-2-match.js <rule> <games> <F> [timeMs=300] [seed=1]
 const fs = require('fs'), path = require('path');
-const src0 = fs.readFileSync(path.join(__dirname, '../src/engine.js'), 'utf8');
+const src0 = fs.readFileSync(path.join(__dirname, '../../src/engine.js'), 'utf8');
 const STOP_OLD = "if (now() - t0 > timeMs * 0.4) break;";
 if (!src0.includes(STOP_OLD)) throw new Error('anchor');
 function load(src) { const m = { exports: {} }; new Function('module', 'require', src)(m, require); return m.exports(); }

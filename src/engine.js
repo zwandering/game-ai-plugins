@@ -2,15 +2,18 @@
  * Gomoku AI engine (15x15), self-contained, no dependencies.
  *
  * - Freestyle gomoku (five or more in a row wins) and Renju (black: exactly
- *   five wins; overline / double-four / double-three are forbidden for black).
+ *   five wins; overline / double-four / double-three are forbidden for black,
+ *   with the recursive "real three" rule).
  * - Incremental pattern evaluation: for every empty cell and every direction we
  *   keep the shape that a stone of each colour would create there (five, open
- *   four, four, open three, ...).  Shapes come from a 3^8 lookup table built at
- *   start-up by brute force, so the threat semantics are exact per line.
+ *   four, four, open three, ...).  Shapes come from a 3^10 lookup table (five
+ *   cells each side) built at start-up by brute force, so line semantics are
+ *   exact, including overlines and same-line double fours.
  * - Iterative-deepening negamax with alpha-beta, transposition table (Zobrist),
- *   threat-based forced-move pruning, a small quiescence on open-three threats,
- *   and VCF (victory by continuous fours) search at the root and at leaves,
- *   for both sides.
+ *   threat-based forced-move pruning and a small quiescence on open threes.
+ * - Threat-space search for both sides: VCF (victory by continuous fours) and
+ *   VCT (victory by continuous threats: fours and open threes), each with a
+ *   cache of positions already proven to fail.
  *
  * Everything lives inside createGomokuEngine() so the function can be
  * stringified and shipped into a Web Worker.
@@ -23,13 +26,15 @@ function createGomokuEngine() {
   const CENTER = 7 * SIZE + 7;
   const EMPTY = 0, BLACK = 1, WHITE = 2;
 
-  // Shapes a stone would create in one direction, weakest to strongest.
+  // Shapes a stone would create in one direction.
   const S_NONE = 0, S_TWO = 1, S_OPEN_TWO = 2, S_THREE = 3, S_OPEN_THREE = 4,
-    S_FOUR = 5, S_OPEN_FOUR = 6, S_FIVE = 7, S_OVERLINE = 8;
-  const SHAPE_NAMES = ['none', 'two', 'open-two', 'three', 'open-three', 'four', 'open-four', 'five', 'overline'];
+    S_FOUR = 5, S_OPEN_FOUR = 6, S_FIVE = 7, S_OVERLINE = 8, S_DFOUR_LINE = 9;
+  // S_DFOUR_LINE: two fours on the same line (X.XXX.X) for renju black, which is
+  // a forbidden double four.  Freestyle/white get S_OPEN_FOUR for that pattern.
+  const SHAPE_NAMES = ['none', 'two', 'open-two', 'three', 'open-three', 'four', 'open-four', 'five', 'overline', 'double-four-line'];
 
   // Per-direction value of a shape (used for move ordering and evaluation).
-  const SHAPE_VALUE = [0, 4, 14, 30, 300, 400, 5000, 200000, 0];
+  const SHAPE_VALUE = [0, 4, 14, 30, 300, 400, 5000, 200000, 0, 5000];
   const BONUS_DOUBLE_FOUR = 5000;   // two fours in different directions
   const BONUS_FOUR_THREE = 2500;    // four + open three
   const BONUS_DOUBLE_THREE = 1500;  // two open threes
@@ -43,27 +48,36 @@ function createGomokuEngine() {
   const WIN_THRESHOLD = WIN - 200;
 
   const DIRS = [[0, 1], [1, 0], [1, 1], [1, -1]];
+  const W = 5;            // cells looked at on each side
+  const K = 2 * W;        // neighbours per direction
+  const LN = K + 1;       // line length including the centre
+  const C0 = W;           // index of the centre in the line
 
   // ------------------------------------------------------------------ tables
-  // key = sum(v_i * 3^i), i = 0..3 are offsets -4..-1, i = 4..7 are offsets +1..+4
+  // key = sum(v_i * 3^i), i = 0..4 are offsets -5..-1, i = 5..9 are offsets +1..+5
   // v = 0 empty, 1 own stone, 2 opponent stone or board edge.
+  // Only offsets -4..+4 can be filled when looking for fours/threes (a five
+  // through the centre never reaches +-5); offsets +-5 only matter as run
+  // boundaries, i.e. to tell a five from an overline.
   function buildShapeTable(exactFive) {
-    const table = new Uint8Array(6561);
-    const ln = new Uint8Array(9);
+    const table = new Uint8Array(Math.pow(3, K));
+    const ln = new Uint8Array(LN);
+    const pts = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     function fiveShape() {
-      let l = 4, r = 4;
+      let l = C0, r = C0;
       while (l > 0 && ln[l - 1] === 1) l--;
-      while (r < 8 && ln[r + 1] === 1) r++;
+      while (r < LN - 1 && ln[r + 1] === 1) r++;
       const len = r - l + 1;
       if (exactFive) return len === 5 ? S_FIVE : (len > 5 ? S_OVERLINE : S_NONE);
       return len >= 5 ? S_FIVE : S_NONE;
     }
-    function fourCount() {
+    // number of cells that complete a five through the centre (stores them in pts)
+    function fourPoints() {
       let c = 0;
-      for (let q = 0; q < 9; q++) {
+      for (let q = 1; q < LN - 1; q++) {
         if (ln[q] !== 0) continue;
         ln[q] = 1;
-        if (fiveShape() === S_FIVE) c++;
+        if (fiveShape() === S_FIVE) pts[c++] = q;
         ln[q] = 0;
       }
       return c;
@@ -71,12 +85,21 @@ function createGomokuEngine() {
     function shapeOf(depth) {
       const f = fiveShape();
       if (f !== S_NONE) return f;
-      const fc = fourCount();
-      if (fc >= 2) return S_OPEN_FOUR;
+      const fc = fourPoints();
+      if (fc >= 2) {
+        if (!exactFive) return S_OPEN_FOUR;
+        // straight four: exactly two five-points at both ends of one run of four
+        if (fc === 2 && pts[1] - pts[0] === 5) {
+          let ok = true;
+          for (let i = pts[0] + 1; i < pts[1]; i++) if (ln[i] !== 1) { ok = false; break; }
+          if (ok) return S_OPEN_FOUR;
+        }
+        return S_DFOUR_LINE;
+      }
       if (fc === 1) return S_FOUR;
       if (depth >= 2) return S_NONE;
       let best = S_NONE;
-      for (let q = 0; q < 9; q++) {
+      for (let q = 1; q < LN - 1; q++) {
         if (ln[q] !== 0) continue;
         ln[q] = 1;
         const s = shapeOf(depth + 1);
@@ -90,13 +113,13 @@ function createGomokuEngine() {
       }
       return best;
     }
-    for (let key = 0; key < 6561; key++) {
+    for (let key = 0; key < table.length; key++) {
       let k = key;
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < K; i++) {
         const v = k % 3; k = (k - v) / 3;
-        ln[i < 4 ? i : i + 1] = v;
+        ln[i < W ? i : i + 1] = v;
       }
-      ln[4] = 1;
+      ln[C0] = 1;
       table[key] = shapeOf(0);
     }
     return table;
@@ -105,8 +128,8 @@ function createGomokuEngine() {
   const TABLE_FREE = buildShapeTable(false);
   const TABLE_RENJU_BLACK = buildShapeTable(true);
 
-  // Neighbour table: NBR[((d * N) + p) * 8 + i] = cell index, or -1 off-board.
-  const NBR = new Int16Array(4 * N * 8);
+  // Neighbour table: NBR[((d * N) + p) * K + i] = cell index, or -1 off-board.
+  const NBR = new Int16Array(4 * N * K);
   // Cells within Chebyshev distance 2 (candidate generation).
   const NEAR = new Int16Array(N * 24);
   const NEAR_CNT = new Uint8Array(N);
@@ -115,10 +138,10 @@ function createGomokuEngine() {
       const r = (p / SIZE) | 0, c = p % SIZE;
       for (let d = 0; d < 4; d++) {
         const dr = DIRS[d][0], dc = DIRS[d][1];
-        for (let i = 0; i < 8; i++) {
-          const off = i < 4 ? i - 4 : i - 3; // -4..-1, +1..+4
+        for (let i = 0; i < K; i++) {
+          const off = i < W ? i - W : i - W + 1; // -5..-1, +1..+5
           const rr = r + dr * off, cc = c + dc * off;
-          NBR[((d * N) + p) * 8 + i] = (rr < 0 || rr >= SIZE || cc < 0 || cc >= SIZE) ? -1 : rr * SIZE + cc;
+          NBR[((d * N) + p) * K + i] = (rr < 0 || rr >= SIZE || cc < 0 || cc >= SIZE) ? -1 : rr * SIZE + cc;
         }
       }
       let n = 0;
@@ -148,6 +171,8 @@ function createGomokuEngine() {
     for (let i = 0, j = n - 1; i < j; i++, j--) { const t = sub[i]; sub[i] = sub[j]; sub[j] = t; }
   }
 
+  const CACHE_LIMIT = 400000;
+
   // ------------------------------------------------------------------ engine
   class Engine {
     constructor(opts) {
@@ -174,12 +199,17 @@ function createGomokuEngine() {
       this.ttMove = new Int16Array(size);
       this.ttGen = new Uint8Array(size);
       this.gen = 0;
+      // threat-search caches: position+attacker -> remaining plies already proven insufficient
+      this.vcfFail = new Map();
+      this.vctFail = new Map();
       // search scratch
       this.candBuf = [];
       for (let i = 0; i <= MAX_PLY + 2; i++) this.candBuf.push(new Float64Array(N));
-      this.nodes = 0; this.vcfNodes = 0;
+      this.nodes = 0; this.vcfNodes = 0; this.vctNodes = 0;
+      this.vcfMove = -1; this.vctMove = -1; this.vctRoot = 0; this.vctDeadline = Infinity;
       this.deadline = Infinity; this.aborted = false;
       this.rootBest = -1; this.rootScore = -INF;
+      this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
       this.reset();
     }
 
@@ -211,10 +241,10 @@ function createGomokuEngine() {
     tableFor(c) { return (this.rule === 'renju' && c === BLACK) ? TABLE_RENJU_BLACK : TABLE_FREE; }
 
     computeShape(c, d, q) {
-      const base = ((d * N) + q) * 8;
+      const base = ((d * N) + q) * K;
       const board = this.board;
       let key = 0, mul = 1;
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < K; i++) {
         const idx = NBR[base + i];
         let v;
         if (idx < 0) v = 2;
@@ -239,11 +269,12 @@ function createGomokuEngine() {
             if (s === S_FIVE) five = true;
             else if (s === S_OVERLINE) overline = true;
             else if (s === S_OPEN_FOUR) { openFour = true; fours++; }
+            else if (s === S_DFOUR_LINE) fours += 2;
             else if (s === S_FOUR) fours++;
             else if (s === S_OPEN_THREE) openThrees++;
           }
           if (five) { cat = CAT_FIVE; }
-          else if (renju && ci === 0 && (overline || fours >= 2 || openThrees >= 2)) { score = 0; cat = CAT_NONE; } // forbidden for black
+          else if (renju && ci === 0 && (overline || fours >= 2 || openThrees >= 2)) { score = 0; cat = CAT_NONE; } // forbidden for black (double three re-checked exactly in isForbidden)
           else if (openFour || fours >= 2) { cat = CAT_WIN2; if (fours >= 2) score += BONUS_DOUBLE_FOUR; }
           else if (fours >= 1) { cat = CAT_FOUR; if (openThrees >= 1) score += BONUS_FOUR_THREE; }
           else if (openThrees >= 1) { cat = CAT_OPEN_THREE; if (openThrees >= 2) score += BONUS_DOUBLE_THREE; }
@@ -253,12 +284,12 @@ function createGomokuEngine() {
       }
     }
 
-    /** Update every empty cell whose line windows include p. */
+    /** Update every empty cell whose line windows (5 each side) include p. */
     updateAround(p) {
       const board = this.board, shape = this.shape;
       for (let d = 0; d < 4; d++) {
-        const base = ((d * N) + p) * 8;
-        for (let i = 0; i < 8; i++) {
+        const base = ((d * N) + p) * K;
+        for (let i = 0; i < K; i++) {
           const q = NBR[base + i];
           if (q < 0 || board[q] !== EMPTY) continue;
           shape[(0 * 4 + d) * N + q] = this.computeShape(BLACK, d, q);
@@ -296,18 +327,43 @@ function createGomokuEngine() {
       return p;
     }
 
-    /** Renju: is black forbidden to play at p? (false for occupied cells and in freestyle) */
-    isForbidden(p) {
-      if (this.rule !== 'renju' || this.board[p] !== EMPTY) return false;
-      let fours = 0, openThrees = 0;
+    /**
+     * Renju: is black forbidden to play at p? (false for occupied cells and in freestyle)
+     * An exact five always wins.  Overline, two fours (also on one line) and two
+     * real threes are forbidden.  A three only counts if it can become a straight
+     * four on a point that is itself not forbidden (checked recursively).
+     */
+    isForbidden(p, depth) {
+      if (this.rule !== 'renju' || p < 0 || p >= N || this.board[p] !== EMPTY) return false;
+      depth = depth || 0;
+      const shape = this.shape;
+      for (let d = 0; d < 4; d++) if (shape[d * N + p] === S_FIVE) return false;
+      let fours = 0, threes = 0, threeMask = 0;
       for (let d = 0; d < 4; d++) {
-        const s = this.shape[d * N + p];
-        if (s === S_FIVE) return false;
+        const s = shape[d * N + p];
         if (s === S_OVERLINE) return true;
         if (s === S_FOUR || s === S_OPEN_FOUR) fours++;
-        else if (s === S_OPEN_THREE) openThrees++;
+        else if (s === S_DFOUR_LINE) fours += 2;
+        else if (s === S_OPEN_THREE) { threes++; threeMask |= 1 << d; }
       }
-      return fours >= 2 || openThrees >= 2;
+      if (fours >= 2) return true;
+      if (threes < 2) return false;
+      if (depth >= 2) return true; // deep enough: treat threes as real
+      // Verify each three: after p, some empty point on that line must make a
+      // straight four and not be forbidden itself.
+      this.play(p, BLACK);
+      let real = 0;
+      for (let d = 0; d < 4 && real < 2; d++) {
+        if (!(threeMask & (1 << d))) continue;
+        const base = ((d * N) + p) * K;
+        for (let i = 0; i < K; i++) {
+          const x = NBR[base + i];
+          if (x < 0 || this.board[x] !== EMPTY) continue;
+          if (shape[d * N + x] === S_OPEN_FOUR && !this.isForbidden(x, depth + 1)) { real++; break; }
+        }
+      }
+      this.undo();
+      return real >= 2;
     }
 
     legal(p, c) {
@@ -342,6 +398,18 @@ function createGomokuEngine() {
       const base = (c - 1) * N, arr = this.cat;
       for (let p = 0; p < N; p++) if (arr[base + p] === cat) return p;
       return -1;
+    }
+
+    /** Best-looking legal move for `me` (fallback), or -1 if there is none. */
+    anyLegalMove(me) {
+      const mi = me - 1, oi = 2 - me;
+      let best = -1, bestS = -1;
+      for (let p = 0; p < N; p++) {
+        if (this.board[p] !== EMPTY) continue;
+        const s = this.score[mi * N + p] + this.score[oi * N + p] + this.nb[p];
+        if (s > bestS && this.legal(p, me)) { bestS = s; best = p; }
+      }
+      return best;
     }
 
     // ---------------------------------------------------------------- move generation
@@ -406,6 +474,11 @@ function createGomokuEngine() {
       this.ttFlag[idx] = flag; this.ttMove[idx] = move; this.ttGen[idx] = this.gen;
     }
 
+    /** 53-bit key of the current position plus the attacking colour. */
+    posKey(me) {
+      return (this.hashHi >>> 0) * 2097152 + (this.hashLo & 0xFFFFF) * 2 + (me - 1);
+    }
+
     // ---------------------------------------------------------------- VCF
     /**
      * Victory by continuous fours for `me` (me to move).
@@ -423,8 +496,12 @@ function createGomokuEngine() {
         if (ply === rootPly) this.vcfMove = this.firstCellWithCat(me, CAT_WIN2);
         return 3;
       }
-      if (ply - rootPly >= maxPly || this.vcfNodes <= 0) return 0;
+      const rem = maxPly - (ply - rootPly);
+      if (rem <= 0 || this.vcfNodes <= 0) return 0;
       if (this.catCount[mi * 5 + CAT_FOUR] === 0) return 0;
+      const key = this.posKey(me);
+      const failed = this.vcfFail.get(key);
+      if (failed !== undefined && failed >= rem) return 0;
       // Snapshot the four-making cells first: play() mutates categories.
       const base = mi * N, list = [];
       for (let p = 0; p < N; p++) if (this.cat[base + p] === CAT_FOUR) list.push(p);
@@ -441,7 +518,6 @@ function createGomokuEngine() {
             if (!this.legal(block, opp)) res = 3; // renju: black cannot block on a forbidden point
             else {
               this.play(block, opp);
-              // If the block makes a five for the opponent... impossible (no prior four). Continue.
               const r = this.vcf(me, ply + 2, maxPly, rootPly);
               this.undo();
               if (r) res = r + 2;
@@ -454,6 +530,10 @@ function createGomokuEngine() {
           return res;
         }
       }
+      if (this.vcfNodes > 0) {
+        if (this.vcfFail.size > CACHE_LIMIT) this.vcfFail.clear();
+        this.vcfFail.set(key, rem);
+      }
       return 0;
     }
 
@@ -462,6 +542,115 @@ function createGomokuEngine() {
       this.vcfNodes = nodes; this.vcfMove = -1;
       const r = this.vcf(c, 0, maxPly, 0);
       return r ? { plies: r, move: this.vcfMove } : null;
+    }
+
+    // ---------------------------------------------------------------- VCT
+    /**
+     * Victory by continuous threats (fours and open threes) for `me`, me to move.
+     * The defender may answer an open three with any block or any counter-four
+     * (a superset of the real defences, so a reported win is sound).
+     * Returns plies to win or 0; at the root the first move is stored in vctMove.
+     */
+    vctAttack(me, ply, maxPly) {
+      const opp = 3 - me, mi = me - 1, oi = opp - 1;
+      const root = ply === this.vctRoot;
+      if (this.catCount[mi * 5 + CAT_FIVE] > 0) {
+        if (root) this.vctMove = this.firstCellWithCat(me, CAT_FIVE);
+        return 1;
+      }
+      if (this.catCount[oi * 5 + CAT_FIVE] > 0) {
+        // The defender answered with a four: block it, our threat must still stand.
+        if (root || this.catCount[oi * 5 + CAT_FIVE] >= 2) return 0;
+        const b = this.firstCellWithCat(opp, CAT_FIVE);
+        if (!this.legal(b, me)) return 0;
+        this.play(b, me);
+        const r = this.vctDefend(me, ply + 1, maxPly);
+        this.undo();
+        return r ? r + 1 : 0;
+      }
+      if (this.catCount[mi * 5 + CAT_WIN2] > 0) {
+        if (root) this.vctMove = this.firstCellWithCat(me, CAT_WIN2);
+        return 3;
+      }
+      const rem = maxPly - (ply - this.vctRoot);
+      if (rem <= 0 || this.vctNodes <= 0) return 0;
+      if ((this.vctNodes & 63) === 0 && now() > this.vctDeadline) { this.vctNodes = 0; return 0; }
+      const key = this.posKey(me);
+      const failed = this.vctFail.get(key);
+      if (failed !== undefined && failed >= rem) return 0;
+
+      // Continuous fours alone may already win.
+      if (this.catCount[mi * 5 + CAT_FOUR] > 0) {
+        this.vcfNodes = 400; this.vcfMove = -1;
+        const f = this.vcf(me, ply, rem, ply);
+        if (f) { if (root) this.vctMove = this.vcfMove; return f; }
+      }
+
+      // Attacking moves: fours and open threes, best first.
+      const base = mi * N, list = [];
+      for (let p = 0; p < N; p++) {
+        const c = this.cat[base + p];
+        if (c === CAT_FOUR || c === CAT_OPEN_THREE) list.push(p);
+      }
+      if (list.length === 0) return 0;
+      list.sort((a, b) => (this.score[base + b] * 2 + this.score[oi * N + b]) - (this.score[base + a] * 2 + this.score[oi * N + a]));
+      const limit = Math.min(list.length, root ? 16 : 10);
+      for (let i = 0; i < limit; i++) {
+        const p = list[i];
+        if (this.vctNodes-- <= 0) return 0;
+        this.play(p, me);
+        const r = this.vctDefend(me, ply + 1, maxPly);
+        this.undo();
+        if (r) {
+          if (root) this.vctMove = p;
+          return r + 1;
+        }
+        if (this.vctNodes <= 0) return 0;
+      }
+      if (this.vctNodes > 0) {
+        if (this.vctFail.size > CACHE_LIMIT) this.vctFail.clear();
+        this.vctFail.set(key, rem);
+      }
+      return 0;
+    }
+
+    /** Defender (3 - me) to move after an attacking move of `me`. */
+    vctDefend(me, ply, maxPly) {
+      const opp = 3 - me, mi = me - 1, oi = opp - 1;
+      if (this.catCount[oi * 5 + CAT_FIVE] > 0) return 0;          // defender completes five first
+      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) return 2;
+      if (this.catCount[mi * 5 + CAT_FIVE] === 1) {
+        const b = this.firstCellWithCat(me, CAT_FIVE);
+        if (!this.legal(b, opp)) return 2;
+        this.play(b, opp);
+        const r = this.vctAttack(me, ply + 1, maxPly);
+        this.undo();
+        return r ? r + 1 : 0;
+      }
+      if (this.catCount[mi * 5 + CAT_WIN2] === 0) return 0;        // no threat left: initiative lost
+      if (this.vctNodes <= 0) return 0;
+      const n = this.genDefence(opp, ply);
+      if (n === 0) return 4;
+      const buf = this.candBuf[ply], moves = new Array(n);
+      for (let i = 0; i < n; i++) moves[i] = buf[i] % 256;
+      let worst = 0;
+      for (let i = 0; i < n; i++) {
+        this.vctNodes--;
+        this.play(moves[i], opp);
+        const r = this.vctAttack(me, ply + 1, maxPly);
+        this.undo();
+        if (!r) return 0;
+        if (r > worst) worst = r;
+      }
+      return worst + 1;
+    }
+
+    /** Bounded VCT for colour c (c to move). */
+    findVct(c, nodes, maxPly, deadline) {
+      this.vctNodes = nodes; this.vctMove = -1; this.vctRoot = 0;
+      this.vctDeadline = deadline || Infinity;
+      const r = this.vctAttack(c, 0, maxPly);
+      return r ? { plies: r, move: this.vctMove } : null;
     }
 
     // ---------------------------------------------------------------- search
@@ -512,7 +701,7 @@ function createGomokuEngine() {
       else n = this.genNormal(me, ply, ply === 0 ? this.rootWidth : (ply < 2 ? 14 : (ply < 6 ? 10 : 8)));
       const buf = this.candBuf[ply];
       if (n === 0) return oppThreat ? -(WIN - ply - 4) : this.evaluate(me);
-      // Root: restrict to the moves the caller allows (e.g. moves that stop an opponent VCF).
+      // Root: restrict to the moves the caller allows (e.g. moves that stop an opponent threat sequence).
       if (ply === 0 && this.rootFilter) {
         let m = 0;
         for (let i = 0; i < n; i++) if (this.rootFilter.has(buf[i] % 256)) buf[m++] = buf[i];
@@ -546,24 +735,53 @@ function createGomokuEngine() {
       return best;
     }
 
+    /** Does the opponent still have a VCF (or, if checkVct, a VCT) after my move p? */
+    stillThreatened(p, me, checkVct, vctDeadline) {
+      const opp = 3 - me, mi = me - 1;
+      this.play(p, me);
+      let threatened;
+      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) threatened = false;       // p wins outright
+      else if (this.catCount[mi * 5 + CAT_FIVE] === 1) {
+        // p is a four: the opponent must block first, then look again.
+        const b = this.firstCellWithCat(me, CAT_FIVE);
+        if (!this.legal(b, opp)) threatened = false;
+        else {
+          this.play(b, opp);
+          threatened = !!this.findVcf(opp, 6000, 24) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+          this.undo();
+        }
+      } else {
+        threatened = !!this.findVcf(opp, 6000, 24) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+      }
+      this.undo();
+      return threatened;
+    }
+
     /**
      * Choose a move for colour `me`.
-     * opts: { timeMs (default 1500), maxDepth (default 16) }
+     * opts: { timeMs (default 1500), maxDepth (default 16), vct (default true) }
      * Returns { move, score, depth, nodes, timeMs, pv, reason } with cell indices.
      */
     think(me, opts) {
       opts = opts || {};
       const timeMs = opts.timeMs || 1500;
       const maxDepth = opts.maxDepth || 16;
+      const useVct = opts.vct !== false;
       const t0 = now();
       const opp = 3 - me, mi = me - 1, oi = opp - 1;
       this.nodes = 0; this.aborted = false; this.gen = (this.gen + 1) & 255;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
       this.deadline = Infinity;
-      const done = (move, score, reason, depth) => ({
-        move, score, reason, depth: depth || 0, nodes: this.nodes,
-        timeMs: Math.round(now() - t0), pv: this.extractPv(me, move),
-      });
+      const done = (move, score, reason, depth) => {
+        if (move < 0 || !this.legal(move, me)) {
+          const alt = this.anyLegalMove(me);
+          if (alt >= 0) move = alt;
+        }
+        return {
+          move, score, reason, depth: depth || 0, nodes: this.nodes,
+          timeMs: Math.round(now() - t0), pv: this.extractPv(me, move),
+        };
+      };
 
       // Opening book (tiny): centre, then a diagonal/adjacent reply.
       if (this.stones === 0) return done(CENTER, 0, 'opening', 0);
@@ -578,32 +796,38 @@ function createGomokuEngine() {
           const s = this.score[mi * N + p];
           if (s > bestS) { bestS = s; bestP = p; }
         }
-        if (bestP < 0) bestP = this.firstCellWithCat(opp, CAT_FIVE);
+        if (bestP < 0) return done(this.anyLegalMove(me), -WIN, 'lost', 1); // no legal block (renju)
         return done(bestP, this.catCount[oi * 5 + CAT_FIVE] >= 2 ? -WIN : 0, 'block-four', 1);
       }
       if (this.catCount[mi * 5 + CAT_WIN2] > 0) return done(this.firstCellWithCat(me, CAT_WIN2), WIN - 3, 'open-four', 3);
 
       // Own VCF at the root (deep, generous budget).
-      const own = this.findVcf(me, opts.vcfNodes || 40000, 30);
+      const own = this.findVcf(me, opts.vcfNodes || 60000, 30);
       if (own && own.move >= 0) return done(own.move, WIN - own.plies, 'vcf', own.plies);
 
-      // Opponent VCF threat: only consider moves after which it disappears.
-      // Checked if the opponent has any four-making cell (a VCF needs one).
-      if (this.catCount[oi * 5 + CAT_FOUR] > 0 || this.catCount[oi * 5 + CAT_WIN2] > 0) {
-        const threat = this.findVcf(opp, 20000, 24);
-        if (threat) {
-          const safe = new Set();
-          const n = this.genNormal(me, 0, 60);
-          const t1 = now();
-          for (let i = 0; i < n && now() - t1 < timeMs * 0.3; i++) {
-            const p = this.candBuf[0][i] % 256;
-            this.play(p, me);
-            const still = this.findVcf(opp, 6000, 24);
-            this.undo();
-            if (!still) safe.add(p);
-          }
-          if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
+      // Own VCT (threes and fours), unless the opponent can win by fours first.
+      const oppVcf = (this.catCount[oi * 5 + CAT_FOUR] > 0 || this.catCount[oi * 5 + CAT_WIN2] > 0)
+        ? this.findVcf(opp, 60000, 30) : null;
+      if (useVct && !oppVcf && this.catCount[oi * 5 + CAT_WIN2] === 0) {
+        const vct = this.findVct(me, 40000, 14, t0 + timeMs * 0.2);
+        if (vct && vct.move >= 0) return done(vct.move, WIN - vct.plies, 'vct', vct.plies);
+      }
+
+      // Opponent threat sequences: only consider moves after which they are gone.
+      let oppVct = null;
+      if (useVct && !oppVcf) oppVct = this.findVct(opp, 20000, 12, t0 + timeMs * 0.35);
+      if (oppVcf || oppVct) {
+        const safe = new Set();
+        const n = this.genNormal(me, 0, 60);
+        const cands = [];
+        for (let i = 0; i < n; i++) cands.push(this.candBuf[0][i] % 256);
+        // also every move that makes a four (forcing replies)
+        for (let p = 0; p < N; p++) if (this.cat[mi * N + p] >= CAT_FOUR && cands.indexOf(p) < 0) cands.push(p);
+        const t1 = now(), budget = timeMs * 0.3;
+        for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
+          if (!this.stillThreatened(cands[i], me, useVct, t1 + budget)) safe.add(cands[i]);
         }
+        if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
       }
 
       // Iterative deepening.
@@ -624,9 +848,9 @@ function createGomokuEngine() {
         if (Math.abs(s) >= WIN_THRESHOLD) break;
         if (now() - t0 > timeMs * 0.4) break; // next iteration would not finish
       }
-      if (bestMove < 0 || this.board[bestMove] !== EMPTY) {
+      if (bestMove < 0 || !this.legal(bestMove, me)) {
         const n = this.genNormal(me, 0, 1);
-        bestMove = n > 0 ? this.candBuf[0][0] % 256 : this.firstEmpty();
+        bestMove = n > 0 ? this.candBuf[0][0] % 256 : this.anyLegalMove(me);
       }
       this.rootFilter = null;
       return done(bestMove, bestScore, 'search', bestDepth);
