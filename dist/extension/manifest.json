@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Gomoku AI 助手 (gomoku.com)",
+  "version": "1.0.0",
+  "description": "为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gomoku.com/*",
+        "https://www.gomoku.com/*"
+      ],
+      "js": [
+        "engine.js",
+        "controller.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "icons": {
+    "128": "icon128.png"
+  }
+}
