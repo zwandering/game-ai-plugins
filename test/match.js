@@ -199,7 +199,12 @@ function playGame(gi, rule, timeMs, baseSeed, engine, oracle) {
       p = r.move; info = { score: r.score, depth: r.depth, reason: r.reason, timeMs: r.timeMs, nodes: r.nodes };
       engTimes.push(r.timeMs);
     } else {
-      if (OPP_MS > 0) { oppEngine.setBoard(board); p = oppEngine.think(color, { timeMs: OPP_MS }).move; }
+      if (OPP_MS > 0) {
+        oppEngine.setBoard(board);
+        const ro = oppEngine.think(color, { timeMs: OPP_MS });
+        p = ro.move;
+        info = { score: ro.score, depth: ro.depth, reason: ro.reason, timeMs: ro.timeMs, nodes: ro.nodes }; // recorded for calibration
+      }
       else p = baseline.chooseMove(board, color, { rule, isForbidden: rule === "renju" ? isForbOracle : null });
     }
     if (p < 0 || p >= N || board[p]) { result = { winner: 3 - color, why: 'illegal-occupied ' + coord(p) + ' by ' + (color === engineColor ? 'engine' : 'baseline') }; break; }

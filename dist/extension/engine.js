@@ -173,6 +173,19 @@ function createGomokuEngine() {
 
   const CACHE_LIMIT = 150000;
 
+  // Score -> win probability, fitted on ~22k positions from 1200 self-play games
+  // by test/calibrate-winrate.js (samples in test/data/winrate-samples.csv):
+  //   P(side to move wins) = sigmoid(score / K + B * (side to move is black ? +1 : -1))
+  // The model is symmetric so the displayed win rate is the same whether it is
+  // computed on my turn or on the opponent's next turn (no zigzag).
+  const WINRATE_MODEL = {
+    freestyle: { K: 3767, B: 0.289 },
+    renju: { K: 3171, B: -0.176 },
+  };
+  // think() reasons whose score is a real evaluation (others, like a forced
+  // block or the opening book, return a placeholder 0).
+  const REAL_SCORE = { search: 1, vcf: 1, vct: 1, win: 1, 'open-four': 1, lost: 1 };
+
   // ------------------------------------------------------------------ engine
   class Engine {
     constructor(opts) {
@@ -856,6 +869,7 @@ function createGomokuEngine() {
       const opp = 3 - me, mi = me - 1, oi = opp - 1;
       this.nodes = 0; this.aborted = false; this.gen = (this.gen + 1) & 255;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
+      this.lastUnsafe = new Set(); // moves proven to leave the opponent a forced win
       this.deadline = Infinity;
       const done = (move, score, reason, depth) => {
         if (move < 0 || !this.legal(move, me)) {
@@ -927,8 +941,10 @@ function createGomokuEngine() {
           if (this.cat[mi * N + p] >= CAT_FOUR || (me === BLACK && this.rule === 'renju' && this.mfLegal(p, CAT_FOUR))) cands.push(p);
         }
         const t1 = now(), budget = timeMs * 0.15;
+        this.lastUnsafe = new Set();
         for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
           if (!this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget)) safe.add(cands[i]);
+          else this.lastUnsafe.add(cands[i]);
         }
         if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
       }
@@ -967,6 +983,175 @@ function createGomokuEngine() {
       this.rootFilter = null;
       if (bestScore >= WIN_THRESHOLD) this.winning = true; // keep pressing on the next move
       return done(bestMove, bestScore, 'search', bestDepth);
+    }
+
+    // ---------------------------------------------------------------- analysis
+    /** P(colour c wins) in a position where c is to move and c's score is `score`. */
+    winRate(score, c) {
+      if (score >= WIN_THRESHOLD) return 1;
+      if (score <= -WIN_THRESHOLD) return 0;
+      const m = WINRATE_MODEL[this.rule];
+      return 1 / (1 + Math.exp(-(score / m.K + (c === BLACK ? m.B : -m.B))));
+    }
+
+    /**
+     * Displayed win rates always apply the fitted model from the point of view
+     * of the side whose search produced the score (that is what it was fitted
+     * on): on my turn, a candidate move p is worth winRate(score if I choose p,
+     * me), so the best move equals the position's win rate; on the opponent's
+     * turn, my win rate is 1 - winRate(opponent's score, opponent).
+     * (Mixing the two views shifts values by the tempo terms B and C.)
+     */
+    myWinRate(myScore, me) {
+      return this.winRate(myScore, me);
+    }
+
+    /**
+     * My score after playing p (opponent to move), by iterative deepening with a
+     * full window (exact values, not bounds) until `deadline`. Returns
+     * { score, depth } or null if not even the first pass finished.
+     */
+    scoreAfter(me, p, deadline, maxDepth) {
+      const opp = 3 - me;
+      if (this.cat[(me - 1) * N + p] === CAT_FIVE) return { score: WIN, depth: 0 }; // p completes five
+      let result = null;
+      this.deadline = deadline; this.aborted = false; this.leafVcfNodes = 60;
+      for (let depth = 1; depth <= (maxDepth || 9); depth += 2) {
+        this.play(p, me);
+        const s = -this.negamax(opp, depth, -INF, INF, 1, 2);
+        this.undo();
+        if (this.aborted) break;
+        result = { score: s, depth };
+        if (Math.abs(s) >= WIN_THRESHOLD) break;
+      }
+      return result;
+    }
+
+    /**
+     * Full analysis for the side to move: best move (think), my win rate, the
+     * win rate after each candidate move, and the expected continuation.
+     * opts: { timeMs, analysisMs, maxMoves, pvPlies, pvMs, onProgress(stage, data) }
+     */
+    analyze(me, opts) {
+      opts = opts || {};
+      const opp = 3 - me;
+      const progress = opts.onProgress || (() => {});
+      const best = this.think(me, { timeMs: opts.timeMs || 1500 });
+      const unsafe = this.lastUnsafe || new Set();
+      progress('best', best);
+      if (best.move < 0) return { best, moves: [], pv: { moves: [], winner: 0 } };
+
+      // Candidate moves: the usual move generator, plus the recommended move first.
+      const n = this.genNormal(me, 0, opts.maxMoves || 40);
+      const cands = [];
+      for (let i = 0; i < n; i++) cands.push(this.candBuf[0][i] % 256);
+      const bi = cands.indexOf(best.move);
+      if (bi >= 0) cands.splice(bi, 1);
+      cands.unshift(best.move);
+
+      // Iterative deepening over all candidates (full window, so values are exact).
+      const tA = now(), budget = opts.analysisMs || 1200;
+      const scores = new Map(), depths = new Map();
+      this.deadline = tA + budget; this.aborted = false; this.leafVcfNodes = 60;
+      for (let depth = 1; depth <= 9 && !this.aborted; depth += 2) {
+        // deeper passes go best-first so the interesting moves get refined first
+        const order = depth === 1 ? cands : cands.slice().sort((a, b) => scores.get(b) - scores.get(a));
+        for (const p of order) {
+          if (unsafe.has(p) && scores.has(p)) continue; // already known to lose
+          let v;
+          if (this.cat[(me - 1) * N + p] === CAT_FIVE) v = WIN; // p completes five
+          else {
+            this.play(p, me);
+            v = -this.negamax(opp, depth, -INF, INF, 1, 2);
+            this.undo();
+          }
+          if (this.aborted) break;
+          scores.set(p, unsafe.has(p) ? Math.min(v, -(WIN - 40)) : v);
+          depths.set(p, depth);
+        }
+        if (now() - tA > budget * 0.45) break;
+      }
+
+      // The recommended move keeps think()'s value when it is a real evaluation.
+      // think()'s root search proved no other root move is better at its depth,
+      // so other moves are capped at the recommended move's value.
+      let bestScore = REAL_SCORE[best.reason] ? best.score : (scores.has(best.move) ? scores.get(best.move) : 0);
+      if (!REAL_SCORE[best.reason]) {
+        for (const [, v] of scores) if (v > bestScore) bestScore = v;
+      }
+      const moves = [];
+      for (const [p, v] of scores) {
+        let sc = p === best.move ? bestScore : v;
+        if (p !== best.move && best.reason === 'search' && sc > bestScore) sc = bestScore;
+        moves.push({ move: p, score: sc, win: this.myWinRate(sc, me), depth: depths.get(p) });
+      }
+      moves.sort((a, b) => b.win - a.win || b.score - a.score);
+      const positionWin = this.myWinRate(bestScore, me);
+      progress('moves', { moves, positionWin, bestScore });
+
+      // Expected continuation after the recommended move.
+      const pv = this.principalLine(me, best.move, opts.pvPlies || 8, opts.pvMs || 120);
+      progress('pv', pv);
+      return { best, moves, positionWin, bestScore, pv };
+    }
+
+    /**
+     * Expected continuation: plays `first` for `me`, then lets think() choose for
+     * both sides (msPerPly each). The board is restored afterwards.
+     * Returns { moves: [cells...], winner: colour that completed five, or 0 }.
+     */
+    principalLine(me, first, plies, msPerPly) {
+      const saved = this.winning;
+      const moves = [first];
+      let played = 0, winner = 0;
+      if (!this.legal(first, me)) return { moves: [], winner: 0 };
+      this.play(first, me); played++;
+      if (this.hasWon(me)) winner = me;
+      let c = 3 - me;
+      while (!winner && moves.length < plies && this.stones < N) {
+        const r = this.think(c, { timeMs: msPerPly });
+        if (r.move < 0 || !this.legal(r.move, c)) break;
+        moves.push(r.move);
+        this.play(r.move, c); played++;
+        if (this.hasWon(c)) winner = c;
+        c = 3 - c;
+      }
+      for (let i = 0; i < played; i++) this.undo();
+      this.winning = saved;
+      return { moves, winner };
+    }
+
+    /** Win rate for `me` after playing cell p (used when hovering a cell). */
+    evalMove(me, p, timeMs) {
+      if (!this.legal(p, me)) return { move: p, legal: false };
+      const ms = timeMs || 300;
+      let r = this.scoreAfter(me, p, now() + ms * 0.7, 9);
+      if (!r) r = { score: 0, depth: 0 };
+      let score = r.score;
+      // A forced opponent win that a shallow search misses (VCF/VCT after p).
+      if (score > -WIN_THRESHOLD && score < WIN_THRESHOLD && this.stillThreatened(p, me, true, now() + Math.max(20, ms * 0.3))) {
+        score = -(WIN - 40);
+      }
+      return { move: p, legal: true, score, depth: r.depth, win: this.myWinRate(score, me) };
+    }
+
+    /**
+     * Evaluate the position for the side to move c (used on the opponent's turn).
+     * Returns { score (from c's view), move, winBlack } with the same convention
+     * as myWinRate (the evaluated position is the one after c's best move).
+     */
+    evalPosition(c, timeMs) {
+      const saved = this.winning;
+      const ms = timeMs || 600;
+      const r = this.think(c, { timeMs: ms });
+      let score = r.score;
+      if (!REAL_SCORE[r.reason] && r.move >= 0) {
+        const a = this.scoreAfter(c, r.move, now() + Math.max(50, ms * 0.5), 7);
+        if (a) score = a.score;
+      }
+      this.winning = saved;
+      const pc = this.winRate(score, c); // P(c wins), c to move
+      return { move: r.move, score, reason: r.reason, winBlack: c === BLACK ? pc : 1 - pc };
     }
 
     firstEmpty() {
@@ -1018,30 +1203,76 @@ function createGomokuEngine() {
     return arr;
   }
 
-  /** Worker entry point: handles {id, type:'think', board, color, rule, timeMs}. */
-  function workerMain() {
+  /**
+   * Message handler shared by the Web Worker and the main-thread fallback.
+   * Messages: {id, type: 'think'|'analyze'|'evalMove'|'evalPosition'|'ping', board, color, rule, ...}.
+   * Replies via post({id, ok, result}) — 'analyze' also posts {id, ok, progress: stage, result}.
+   */
+  function makeHandler(post) {
     let engine = null, engineRule = null;
-    self.onmessage = (e) => {
-      const msg = e.data || {};
+    return (msg) => {
+      msg = msg || {};
       if (msg.type === 'think') {
         try {
           if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }
           engine.setBoard(msg.board);
           const r = engine.think(msg.color, { timeMs: msg.timeMs });
+          r.win = REAL_SCORE[r.reason] ? engine.myWinRate(r.score, msg.color) : null;
           r.move = r.move >= 0 ? rc(r.move) : null;
           r.pv = r.pv.map(rc);
-          self.postMessage({ id: msg.id, ok: true, result: r });
+          post({ id: msg.id, ok: true, result: r });
         } catch (err) {
-          self.postMessage({ id: msg.id, ok: false, error: String((err && err.stack) || err) });
+          post({ id: msg.id, ok: false, error: String((err && err.stack) || err) });
+        }
+      } else if (msg.type === 'analyze' || msg.type === 'evalMove' || msg.type === 'evalPosition') {
+        try {
+          if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }
+          engine.setBoard(msg.board);
+          const cell = (p) => (p >= 0 ? rc(p) : null);
+          if (msg.type === 'analyze') {
+            const me = msg.color;
+            engine.analyze(me, {
+              timeMs: msg.timeMs, analysisMs: msg.analysisMs, maxMoves: msg.maxMoves,
+              pvPlies: msg.pvPlies, pvMs: msg.pvMs,
+              onProgress: (stage, data) => {
+                let out;
+                if (stage === 'best') {
+                  out = Object.assign({}, data, { move: cell(data.move), pv: data.pv.map(rc),
+                    win: REAL_SCORE[data.reason] ? engine.myWinRate(data.score, me) : null });
+                } else if (stage === 'moves') {
+                  out = { positionWin: data.positionWin, bestScore: data.bestScore,
+                    moves: data.moves.map(m => ({ row: (m.move / SIZE) | 0, col: m.move % SIZE, score: m.score, win: m.win, depth: m.depth })) };
+                } else {
+                  out = { moves: data.moves.map(rc), winner: data.winner };
+                }
+                post({ id: msg.id, ok: true, progress: stage, result: out });
+              },
+            });
+            post({ id: msg.id, ok: true, result: { done: true } });
+          } else if (msg.type === 'evalMove') {
+            const r = engine.evalMove(msg.color, idx(msg.row, msg.col), msg.timeMs);
+            post({ id: msg.id, ok: true, result: Object.assign(r, { move: cell(r.move) }) });
+          } else {
+            const r = engine.evalPosition(msg.color, msg.timeMs);
+            post({ id: msg.id, ok: true, result: Object.assign(r, { move: cell(r.move) }) });
+          }
+        } catch (err) {
+          post({ id: msg.id, ok: false, error: String((err && err.stack) || err) });
         }
       } else if (msg.type === 'ping') {
-        self.postMessage({ id: msg.id, ok: true, result: 'pong' });
+        post({ id: msg.id, ok: true, result: 'pong' });
       }
     };
   }
 
+  /** Worker entry point. */
+  function workerMain() {
+    const handle = makeHandler((m) => self.postMessage(m));
+    self.onmessage = (e) => handle(e.data);
+  }
+
   return {
-    SIZE, N, EMPTY, BLACK, WHITE, WIN, WIN_THRESHOLD, Engine, idx, rc, parseBoard, workerMain,
+    SIZE, N, EMPTY, BLACK, WHITE, WIN, WIN_THRESHOLD, Engine, idx, rc, parseBoard, workerMain, makeHandler, WINRATE_MODEL,
     SHAPE_NAMES, TABLE_FREE, TABLE_RENJU_BLACK,
   };
 }
