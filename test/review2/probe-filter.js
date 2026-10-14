@@ -28,7 +28,7 @@ const t1 = Date.now();
 const rows = [];
 for (const p of cands) {
   const t = Date.now();
-  const th = e.stillThreatened(p, me, true, Infinity);
+  const th = e.stillThreatened(p, me, true, Infinity).threat;
   rows.push(`${name(p)} cat=${e.cat[(me - 1) * 225 + p]} filter:${th ? 'threatened' : 'SAFE'} strong:${strong(p)} ${Date.now() - t}ms cum ${Date.now() - t1}ms`);
 }
 console.log(`think budget for the filter = ${T * 0.2}ms; candidates ${cands.length}`);

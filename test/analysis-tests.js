@@ -167,6 +167,24 @@ test('analyze (renju): never lists a forbidden black move', () => {
   assert(checked > 0, 'no renju black positions generated');
 });
 
+test('analyze: a delaying four is not shown as lost; ignoring an open three is, with its length', () => {
+  // white open three on row 4; black can make a (delaying) four on row 11
+  const b = board({ O: [[4, 5], [4, 6], [4, 7], [11, 4], [9, 9]], X: [[11, 5], [11, 6], [11, 7], [8, 8], [2, 12]] });
+  const { e, res } = runAnalyze(b, BLACK, 'freestyle', { timeMs: 500, analysisMs: 600 });
+  const four = res.moves.find(m => m.move === id(11, 8));
+  assert(four, 'the four move was not analysed');
+  assert(four.win > 0, 'delaying four shown as lost: ' + four.win + ' (score ' + four.score + ')');
+  const block = res.moves.find(m => m.move === res.best.move);
+  assert([id(4, 4), id(4, 8)].includes(res.best.move), 'best should block the open three, got ' + name(res.best.move));
+  assert(block.win >= four.win, 'block should be at least as good as the delaying four');
+  const far = e.evalMove(BLACK, id(0, 0), 300);
+  assert(far.win === 0, 'ignoring the open three should lose: ' + far.win);
+  const dist = 1000000 - Math.abs(far.score);
+  assert(dist >= 2 && dist <= 8, 'loss length not reported sensibly: ' + dist + ' plies');
+  const ev4 = e.evalMove(BLACK, id(11, 8), 300);
+  assert(ev4.win > 0, 'evalMove marks the delaying four as lost');
+});
+
 // ---------------------------------------------------------------- continuation
 test('principalLine: legal alternating moves, board restored, winner really wins', () => {
   for (let seed = 40; seed <= 45; seed++) {

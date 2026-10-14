@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gomoku AI 助手 (gomoku.com)
 // @namespace    https://github.com/local/gomoku-ai-plugin
-// @version      1.2.0
+// @version      1.2.1
 // @description  为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。
 // @match        https://gomoku.com/*
 // @match        https://www.gomoku.com/*
@@ -843,25 +843,36 @@ function createGomokuEngine() {
     }
 
     /** Does the opponent still have a VCF (or, if checkVct, a VCT) after my move p? */
+    /**
+     * Does the opponent still have a forced win (VCF, or VCT if checkVct) after my move p?
+     * Returns { threat, four, plies }:
+     *   threat: the opponent's attack is still there after p (p is not a defence);
+     *   four:   p was a four, so the opponent blocked first and it is MY move again —
+     *           a remaining threat then means "p only delayed", not "p loses";
+     *   plies:  length of the opponent's forced win when four is false (p loses).
+     */
     stillThreatened(p, me, checkVct, vctDeadline) {
       const opp = 3 - me, mi = me - 1;
+      const out = { threat: false, four: false, plies: 0 };
       this.play(p, me);
-      let threatened;
-      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) threatened = false;       // p wins outright
+      const look = () => this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct ? this.findVct(opp, 1500, 12, vctDeadline) : null);
+      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) { /* p wins outright */ }
       else if (this.catCount[mi * 5 + CAT_FIVE] === 1) {
         // p is a four: the opponent must block first, then look again.
+        out.four = true;
         const b = this.firstCellWithCat(me, CAT_FIVE);
-        if (!this.legal(b, opp)) threatened = false;
-        else {
+        if (this.legal(b, opp)) {
           this.play(b, opp);
-          threatened = !!this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+          const v = look();
           this.undo();
+          if (v) out.threat = true;
         }
       } else {
-        threatened = !!this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+        const v = look();
+        if (v) { out.threat = true; out.plies = v.plies; }
       }
       this.undo();
-      return threatened;
+      return out;
     }
 
     /**
@@ -879,7 +890,7 @@ function createGomokuEngine() {
       const opp = 3 - me, mi = me - 1, oi = opp - 1;
       this.nodes = 0; this.aborted = false; this.gen = (this.gen + 1) & 255;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
-      this.lastUnsafe = new Set(); // moves proven to leave the opponent a forced win
+      this.lastUnsafe = new Map(); // move -> plies of the opponent's forced win after it
       this.deadline = Infinity;
       const done = (move, score, reason, depth) => {
         if (move < 0 || !this.legal(move, me)) {
@@ -951,10 +962,12 @@ function createGomokuEngine() {
           if (this.cat[mi * N + p] >= CAT_FOUR || (me === BLACK && this.rule === 'renju' && this.mfLegal(p, CAT_FOUR))) cands.push(p);
         }
         const t1 = now(), budget = timeMs * 0.15;
-        this.lastUnsafe = new Set();
+        this.lastUnsafe = new Map();
         for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
-          if (!this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget)) safe.add(cands[i]);
-          else this.lastUnsafe.add(cands[i]);
+          const t = this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget);
+          if (!t.threat) safe.add(cands[i]);
+          // a delaying four is no defence (kept out of the root moves) but is not lost either
+          else if (!t.four) this.lastUnsafe.set(cands[i], t.plies);
         }
         if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
       }
@@ -1047,7 +1060,7 @@ function createGomokuEngine() {
       const opp = 3 - me;
       const progress = opts.onProgress || (() => {});
       const best = this.think(me, { timeMs: opts.timeMs || 1500 });
-      const unsafe = this.lastUnsafe || new Set();
+      const unsafe = this.lastUnsafe || new Map();
       progress('best', best);
       if (best.move < 0) return { best, moves: [], pv: { moves: [], winner: 0 } };
 
@@ -1076,7 +1089,8 @@ function createGomokuEngine() {
             this.undo();
           }
           if (this.aborted) break;
-          scores.set(p, unsafe.has(p) ? Math.min(v, -(WIN - 40)) : v);
+          // proven loss: my move, then the opponent's forced sequence
+          scores.set(p, unsafe.has(p) ? Math.min(v, -(WIN - 1 - unsafe.get(p))) : v);
           depths.set(p, depth);
         }
         if (now() - tA > budget * 0.45) break;
@@ -1139,8 +1153,10 @@ function createGomokuEngine() {
       if (!r) r = { score: 0, depth: 0 };
       let score = r.score;
       // A forced opponent win that a shallow search misses (VCF/VCT after p).
-      if (score > -WIN_THRESHOLD && score < WIN_THRESHOLD && this.stillThreatened(p, me, true, now() + Math.max(20, ms * 0.3))) {
-        score = -(WIN - 40);
+      // Not for fours: after the forced block it is my move again.
+      if (score > -WIN_THRESHOLD && score < WIN_THRESHOLD) {
+        const t = this.stillThreatened(p, me, true, now() + Math.max(20, ms * 0.3));
+        if (t.threat && !t.four) score = -(WIN - 1 - t.plies);
       }
       return { move: p, legal: true, score, depth: r.depth, win: this.myWinRate(score, me) };
     }
@@ -1486,6 +1502,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   function cellName(rc) { return COLS[rc.col] + (SIZE - rc.row); }
   function colorName(c) { return c === 1 ? '黑' : c === 2 ? '白' : '?'; }
   function pct(p) { return Math.round(p * 100) + '%'; }
+  /** Text for a forced result (win rate exactly 0 or 1): how many own moves to five. */
+  function forcedText(score, win) {
+    const dist = 1000000 - Math.abs(score); // plies until the five, counted from my move
+    if (win === 0) return '必败：对方 ' + Math.max(1, Math.ceil((dist - 1) / 2)) + ' 步内可强制成五';
+    if (win === 1) return '必胜：' + Math.max(1, Math.ceil(dist / 2)) + ' 步内强制成五';
+    return '';
+  }
   function signedPct(d) {
     const v = Math.round(d * 100);
     return (v > 0 ? '+' : v < 0 ? '−' : '±') + Math.abs(v) + '%';
@@ -1506,6 +1529,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   .gai-ghost.end{box-shadow:0 0 0 2px #fab005}
   .gai-heat{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);min-width:19px;height:14px;padding:0 3px;border-radius:7px;
     font:700 9px/14px system-ui,sans-serif;text-align:center;color:#fff;z-index:31;box-shadow:0 1px 2px rgba(0,0,0,.4)}
+  .gai-heat.gai-lost{min-width:13px;height:13px;padding:0;font-size:10px;line-height:13px;opacity:.85}
   .gai-dot{position:absolute;left:50%;top:50%;width:26%;height:26%;transform:translate(-50%,-50%);border-radius:50%;
     z-index:27;opacity:.8}
   #gai-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:288px;background:#1f2430;color:#e9edf3;
@@ -1529,6 +1553,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   #gai-panel .gai-stat{font-variant-numeric:tabular-nums;color:#c3cad6;font-size:12px}
   #gai-panel .gai-move{font-size:18px;font-weight:700;color:#fff}
   #gai-panel .gai-warn{color:#ffa94d;font-size:12px;margin-top:4px}
+  #gai-panel .gai-alert{color:#ff8787;font-size:12px;margin-top:2px}
   #gai-panel .gai-win{display:flex;align-items:baseline;gap:8px}
   #gai-panel .gai-winnum{font-size:22px;font-weight:800;font-variant-numeric:tabular-nums}
   #gai-panel .gai-bar{position:relative;height:10px;border-radius:5px;overflow:hidden;background:#e9ecef;margin:4px 0}
@@ -1591,7 +1616,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         // cells showing a continuation stone keep only its number (hover shows the value)
         if (!cell || st.board[m.row][m.col] !== 0 || ghostCells.has(m.row * SIZE + m.col)) return;
         const d = m.win - a.positionWin;
-        if (i < HEAT_LABELS) addOverlay(cell, 'gai-heat', String(Math.round(m.win * 100)), { background: heatColor(d) });
+        // '×' marks a forced loss (hover for how fast), numbers are win rates in %
+        if (i < HEAT_LABELS || m.win === 0) addOverlay(cell, m.win === 0 ? 'gai-heat gai-lost' : 'gai-heat', m.win === 0 ? '×' : String(Math.round(m.win * 100)), { background: heatColor(d) });
         else addOverlay(cell, 'gai-dot', undefined, { background: heatColor(d) });
       });
     }
@@ -1625,6 +1651,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         <div class="gai-stat gai-status">等待对局开始…</div>
         <div class="gai-stat gai-info"></div>
         <div class="gai-stat gai-hover">&nbsp;</div>
+        <div class="gai-alert" hidden></div>
         <div class="gai-warn" hidden></div>
         <div class="gai-sep"></div>
         <div class="gai-row">
@@ -1641,7 +1668,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       led: q('.gai-led'), modeBtns: panel.querySelectorAll('[data-mode]'),
       winNum: q('.gai-winnum'), winSplit: q('.gai-winsplit'), barFill: q('.gai-barfill'), chart: q('.gai-chart'), last: q('.gai-last'),
       think: q('.gai-think'), thinkV: q('.gai-think-v'), delay: q('.gai-delay'), delayV: q('.gai-delay-v'), delayRow: q('.gai-delay-row'),
-      move: q('.gai-move'), status: q('.gai-status'), info: q('.gai-info'), hover: q('.gai-hover'), warn: q('.gai-warn'),
+      move: q('.gai-move'), status: q('.gai-status'), info: q('.gai-info'), hover: q('.gai-hover'), warn: q('.gai-warn'), alert: q('.gai-alert'),
       heatCb: q('.gai-heat-cb'), pvCb: q('.gai-pv-cb'), now: q('.gai-now'), collapse: q('.gai-collapse'),
     };
     ui.think.value = settings.thinkMs;
@@ -1710,6 +1737,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   function setStatus(text, info) {
     ui.status.textContent = text;
     if (info !== undefined) ui.info.textContent = info;
+  }
+  function setAlert(text) {
+    ui.alert.hidden = !text; ui.alert.textContent = text || '';
   }
   function setWarn(text) {
     ui.warn.hidden = !text; ui.warn.textContent = text || '';
@@ -1826,16 +1856,17 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       return;
     }
     const base = analysis.positionWin;
-    const show = (win, note) => {
-      ui.hover.textContent = win === null ? `若下 ${name}：${note}` :
-        `若下 ${name}：我方胜率 ${pct(win)}（${base !== undefined ? signedPct(win - base) : ''}）${note || ''}`;
+    const show = (win, note, score) => {
+      if (win === null) { ui.hover.textContent = `若下 ${name}：${note}`; return; }
+      const forced = (win === 0 || win === 1) && score !== undefined ? '，' + forcedText(score, win) : '';
+      ui.hover.textContent = `若下 ${name}：我方胜率 ${pct(win)}（${base !== undefined ? signedPct(win - base) : ''}）${forced}${note || ''}`;
     };
     const m = analysis.moves && analysis.moves.find(x => x.row === r && x.col === c);
-    if (m) { show(m.win, ''); return; }
+    if (m) { show(m.win, '', m.score); return; }
     const hk = st.key + '|' + r + ',' + c;
     if (hoverCache.has(hk)) {
       const h = hoverCache.get(hk);
-      if (h.legal === false) show(null, '禁手/不可下'); else show(h.win, '');
+      if (h.legal === false) show(null, '禁手/不可下'); else show(h.win, '', h.score);
       return;
     }
     show(null, '计算中…');
@@ -1906,7 +1937,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     setWarn('');
 
     if (!st.myTurn) {
-      if (!analysis || analysis.key !== st.key) clearOverlays();
+      if (!analysis || analysis.key !== st.key) { clearOverlays(); setAlert(''); }
       setStatus('我方执' + colorName(st.myColor) + '，等待对手…', st.pendingMove ? '' : undefined);
       evaluateOpponentTurn(st);
       return;
@@ -1939,6 +1970,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const a = { key: st.key, best: null, moves: null, positionWin: undefined, pv: null, done: false };
     analysis = a;
     clearOverlays();
+    setAlert('');
     setStatus('思考中…（执' + colorName(st.myColor) + (st.rule === 'renju' ? '，连珠规则' : '') + '）');
     const stillCurrent = () => analysis === a && lastState && lastState.key === a.key;
 
@@ -1965,7 +1997,16 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
           else if (stage === 'moves') {
             a.moves = res.moves; a.positionWin = res.positionWin;
             recordWin(st.stones, st.key, res.positionWin);
-            if (stillCurrent()) drawOverlays(lastState, a);
+            if (stillCurrent()) {
+              drawOverlays(lastState, a);
+              // Explain a heat map full of '×': the opponent has a forced attack.
+              const alive = res.moves.filter(m => m.win > 0);
+              const lost = res.moves.length - alive.length;
+              if (alive.length === 0 && lost > 0) setAlert('对方已有强制取胜手段，所有候选着法都挡不住');
+              else if (lost >= 5 && alive.length <= 3) {
+                setAlert('对方有强制攻势（活三/连续冲四）：只有 ' + alive.map(m => cellName(m)).join('、') + ' 能避免必败，其余标 × 的点都输');
+              } else setAlert('');
+            }
           } else if (stage === 'pv') {
             a.pv = res;
             if (stillCurrent()) {
@@ -2096,7 +2137,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.2.0',
+    readState, setMode, settings, version: '1.2.1',
     debug: () => ({ analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

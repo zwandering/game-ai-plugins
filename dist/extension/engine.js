@@ -833,25 +833,36 @@ function createGomokuEngine() {
     }
 
     /** Does the opponent still have a VCF (or, if checkVct, a VCT) after my move p? */
+    /**
+     * Does the opponent still have a forced win (VCF, or VCT if checkVct) after my move p?
+     * Returns { threat, four, plies }:
+     *   threat: the opponent's attack is still there after p (p is not a defence);
+     *   four:   p was a four, so the opponent blocked first and it is MY move again —
+     *           a remaining threat then means "p only delayed", not "p loses";
+     *   plies:  length of the opponent's forced win when four is false (p loses).
+     */
     stillThreatened(p, me, checkVct, vctDeadline) {
       const opp = 3 - me, mi = me - 1;
+      const out = { threat: false, four: false, plies: 0 };
       this.play(p, me);
-      let threatened;
-      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) threatened = false;       // p wins outright
+      const look = () => this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct ? this.findVct(opp, 1500, 12, vctDeadline) : null);
+      if (this.catCount[mi * 5 + CAT_FIVE] >= 2) { /* p wins outright */ }
       else if (this.catCount[mi * 5 + CAT_FIVE] === 1) {
         // p is a four: the opponent must block first, then look again.
+        out.four = true;
         const b = this.firstCellWithCat(me, CAT_FIVE);
-        if (!this.legal(b, opp)) threatened = false;
-        else {
+        if (this.legal(b, opp)) {
           this.play(b, opp);
-          threatened = !!this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+          const v = look();
           this.undo();
+          if (v) out.threat = true;
         }
       } else {
-        threatened = !!this.findVcf(opp, 6000, 24, vctDeadline) || (checkVct && !!this.findVct(opp, 1500, 12, vctDeadline));
+        const v = look();
+        if (v) { out.threat = true; out.plies = v.plies; }
       }
       this.undo();
-      return threatened;
+      return out;
     }
 
     /**
@@ -869,7 +880,7 @@ function createGomokuEngine() {
       const opp = 3 - me, mi = me - 1, oi = opp - 1;
       this.nodes = 0; this.aborted = false; this.gen = (this.gen + 1) & 255;
       this.rootFilter = null; this.rootWidth = 24; this.leafVcfNodes = 60;
-      this.lastUnsafe = new Set(); // moves proven to leave the opponent a forced win
+      this.lastUnsafe = new Map(); // move -> plies of the opponent's forced win after it
       this.deadline = Infinity;
       const done = (move, score, reason, depth) => {
         if (move < 0 || !this.legal(move, me)) {
@@ -941,10 +952,12 @@ function createGomokuEngine() {
           if (this.cat[mi * N + p] >= CAT_FOUR || (me === BLACK && this.rule === 'renju' && this.mfLegal(p, CAT_FOUR))) cands.push(p);
         }
         const t1 = now(), budget = timeMs * 0.15;
-        this.lastUnsafe = new Set();
+        this.lastUnsafe = new Map();
         for (let i = 0; i < cands.length && now() - t1 < budget; i++) {
-          if (!this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget)) safe.add(cands[i]);
-          else this.lastUnsafe.add(cands[i]);
+          const t = this.stillThreatened(cands[i], me, useVct && opts.oppVct !== false, t1 + budget);
+          if (!t.threat) safe.add(cands[i]);
+          // a delaying four is no defence (kept out of the root moves) but is not lost either
+          else if (!t.four) this.lastUnsafe.set(cands[i], t.plies);
         }
         if (safe.size > 0) { this.rootFilter = safe; this.rootWidth = 60; }
       }
@@ -1037,7 +1050,7 @@ function createGomokuEngine() {
       const opp = 3 - me;
       const progress = opts.onProgress || (() => {});
       const best = this.think(me, { timeMs: opts.timeMs || 1500 });
-      const unsafe = this.lastUnsafe || new Set();
+      const unsafe = this.lastUnsafe || new Map();
       progress('best', best);
       if (best.move < 0) return { best, moves: [], pv: { moves: [], winner: 0 } };
 
@@ -1066,7 +1079,8 @@ function createGomokuEngine() {
             this.undo();
           }
           if (this.aborted) break;
-          scores.set(p, unsafe.has(p) ? Math.min(v, -(WIN - 40)) : v);
+          // proven loss: my move, then the opponent's forced sequence
+          scores.set(p, unsafe.has(p) ? Math.min(v, -(WIN - 1 - unsafe.get(p))) : v);
           depths.set(p, depth);
         }
         if (now() - tA > budget * 0.45) break;
@@ -1129,8 +1143,10 @@ function createGomokuEngine() {
       if (!r) r = { score: 0, depth: 0 };
       let score = r.score;
       // A forced opponent win that a shallow search misses (VCF/VCT after p).
-      if (score > -WIN_THRESHOLD && score < WIN_THRESHOLD && this.stillThreatened(p, me, true, now() + Math.max(20, ms * 0.3))) {
-        score = -(WIN - 40);
+      // Not for fours: after the forced block it is my move again.
+      if (score > -WIN_THRESHOLD && score < WIN_THRESHOLD) {
+        const t = this.stillThreatened(p, me, true, now() + Math.max(20, ms * 0.3));
+        if (t.threat && !t.four) score = -(WIN - 1 - t.plies);
       }
       return { move: p, legal: true, score, depth: r.depth, win: this.myWinRate(score, me) };
     }
