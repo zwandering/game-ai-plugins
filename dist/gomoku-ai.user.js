@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gomoku AI 助手 (gomoku.com)
 // @namespace    https://github.com/local/gomoku-ai-plugin
-// @version      1.4.1
+// @version      1.5.0
 // @description  为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。
 // @match        https://gomoku.com/*
 // @match        https://www.gomoku.com/*
@@ -1348,7 +1348,27 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
   }
   const settings = loadSettings();
-  if (!['off', 'hint', 'auto'].includes(settings.mode)) settings.mode = 'hint';
+  if (!['off', 'hint', 'match', 'auto'].includes(settings.mode)) settings.mode = 'hint';
+
+  // ------------------------------------------------------------------ match mode (比赛模式)
+  // Each side may ask the AI for a move at most MATCH_LIMIT times per game; the
+  // live win rate is always shown, everything else (heat map, hover, previews,
+  // opponent analysis, auto play) is off. In online games the plugin announces
+  // the mode and every hint it uses in the game chat (prefix MATCH_PREFIX), and
+  // reads the opponent's announcements, so both players see each other's count.
+  // This is a mutual, transparent agreement: a client-side tool cannot stop a
+  // player from cheating with other software.
+  const MATCH_LIMIT = 3;
+  const MATCH_PREFIX = '【AI助手·比赛】';
+  const MATCH_KEY = 'gomokuAI.match.v1';
+  function loadMatch() {
+    try { const raw = localStorage.getItem(MATCH_KEY); if (raw) return JSON.parse(raw); } catch (e) { /* ignore */ }
+    return null;
+  }
+  let match = Object.assign({ room: '', used: 0, oppUsed: 0, oppMatch: false, announced: false, maxStones: 0 }, loadMatch() || {});
+  function saveMatch() { try { localStorage.setItem(MATCH_KEY, JSON.stringify(match)); } catch (e) { /* ignore */ } }
+  let matchHint = null;   // { key, best } : the hint shown for the current position
+  let matchOffer = false; // the opponent announced match mode and we have not joined yet
 
   // ------------------------------------------------------------------ engine bridge
   const factory = typeof createGomokuEngine === 'function' ? createGomokuEngine : null;
@@ -1574,6 +1594,14 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   #gai-panel svg{display:block;width:100%;height:46px;background:#262c3a;border-radius:6px}
   #gai-panel .gai-sep{border-top:1px solid #313848;margin:8px 0 6px}
   #gai-panel.collapsed .gai-body{display:none}
+  #gai-panel .gai-match{display:none;margin-top:4px;padding:6px 8px;border:1px solid #5c4bc0;border-radius:8px;background:#272240}
+  #gai-panel.mode-match .gai-match{display:block}
+  #gai-panel.mode-match .gai-hintonly{display:none}
+  #gai-panel .gai-match button{width:100%;margin-top:6px;background:#5f3dc4;border-color:#7048e8;color:#fff}
+  #gai-panel .gai-match button:disabled{background:#3a3550;border-color:#4a4466;color:#9a94b8;cursor:not-allowed}
+  #gai-panel .gai-offer{display:none;margin-top:6px;padding:6px 8px;border-radius:8px;background:#3b2f12;color:#ffd43b;font-size:12px}
+  #gai-panel .gai-offer.show{display:block}
+  #gai-panel .gai-offer button{margin-top:4px;width:100%}
   `;
 
   // ------------------------------------------------------------------ board overlays
@@ -1663,7 +1691,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         <button class="gai-collapse" title="折叠/展开">–</button></div>
       <div class="gai-body">
         <div class="gai-seg">
-          <button data-mode="off">关闭</button><button data-mode="hint">提示</button><button data-mode="auto">自动下棋</button>
+          <button data-mode="off">关闭</button><button data-mode="hint">提示</button><button data-mode="match" title="每方每局最多 3 次 AI 落子建议，胜率一直显示">比赛</button><button data-mode="auto">自动下棋</button>
         </div>
         <div class="gai-win"><span>我方胜率</span><span class="gai-winnum">—</span><span class="gai-stat gai-winsplit"></span></div>
         <div class="gai-bar" title="黑方胜率（深色）"><div class="gai-barfill" style="width:50%"></div><span></span></div>
@@ -1675,18 +1703,24 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         <div class="gai-stat gai-info"></div>
         <div class="gai-stat gai-hover">&nbsp;</div>
         <div class="gai-alert" hidden></div>
+        <div class="gai-match">
+          <div class="gai-stat gai-match-text">比赛模式</div>
+          <button class="gai-match-btn">求助 AI（剩 3 次）</button>
+        </div>
+        <div class="gai-offer"><span class="gai-offer-text">对方开启了比赛模式（每方每局最多 3 次 AI 提示）</span>
+          <button class="gai-offer-btn">同意并开启比赛模式</button></div>
         <div class="gai-warn" hidden></div>
         <div class="gai-sep"></div>
-        <div class="gai-row">
+        <div class="gai-row gai-hintonly">
           <label><input type="checkbox" class="gai-heat-cb">胜率热图</label>
           <label title="鼠标停在某个点上时，在棋盘上画出下在那里的后续变化"><input type="checkbox" class="gai-pv-cb">悬停显示后续</label>
         </div>
-        <div class="gai-row">
+        <div class="gai-row gai-hintonly">
           <label title="对方回合时也分析：对方的最佳着法、各点的对方胜率和预计后续（紫色）"><input type="checkbox" class="gai-opp-cb">帮对手计算</label>
         </div>
         <div class="gai-row"><span>思考时间</span><input class="gai-think" type="range" min="300" max="6000" step="100"><span class="gai-think-v gai-stat"></span></div>
-        <div class="gai-row gai-delay-row"><span>落子延迟</span><input class="gai-delay" type="range" min="0" max="4000" step="100"><span class="gai-delay-v gai-stat"></span></div>
-        <div class="gai-row" style="margin-top:6px"><button class="gai-now">立即计算</button><span class="gai-stat">Alt+A 切换自动</span></div>
+        <div class="gai-row gai-delay-row gai-hintonly"><span>落子延迟</span><input class="gai-delay" type="range" min="0" max="4000" step="100"><span class="gai-delay-v gai-stat"></span></div>
+        <div class="gai-row gai-hintonly" style="margin-top:6px"><button class="gai-now">立即计算</button><span class="gai-stat">Alt+A 切换自动</span></div>
       </div>`;
     document.body.appendChild(panel);
     const q = (s) => panel.querySelector(s);
@@ -1696,6 +1730,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       think: q('.gai-think'), thinkV: q('.gai-think-v'), delay: q('.gai-delay'), delayV: q('.gai-delay-v'), delayRow: q('.gai-delay-row'),
       move: q('.gai-move'), status: q('.gai-status'), info: q('.gai-info'), hover: q('.gai-hover'), warn: q('.gai-warn'), alert: q('.gai-alert'),
       heatCb: q('.gai-heat-cb'), pvCb: q('.gai-pv-cb'), oppCb: q('.gai-opp-cb'), now: q('.gai-now'), collapse: q('.gai-collapse'),
+      matchText: q('.gai-match-text'), matchBtn: q('.gai-match-btn'), offer: q('.gai-offer'), offerBtn: q('.gai-offer-btn'),
     };
     ui.think.value = settings.thinkMs;
     ui.delay.value = settings.delayMs;
@@ -1714,6 +1749,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       onDisplayToggle();
     });
     ui.now.addEventListener('click', () => { invalidate(); schedule(0, true); });
+    ui.matchBtn.addEventListener('click', () => requestMatchHint());
+    ui.offerBtn.addEventListener('click', () => {
+      matchOffer = false;
+      setMode('match');
+      if (settings.mode === 'match' && sendChat(MATCH_PREFIX + '同意比赛模式：每方每局最多' + MATCH_LIMIT + '次AI提示')) { match.announced = true; saveMatch(); }
+      renderMatch();
+    });
     ui.collapse.addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); renderSettings(); });
     makeDraggable(panel, q('.gai-head'));
     if (settings.x !== null && settings.y !== null) placePanel(settings.x, settings.y);
@@ -1755,10 +1797,27 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     ui.delayRow.style.opacity = settings.mode === 'auto' ? '1' : '.5';
     ui.led.className = 'gai-led' + (busy ? ' think' : (settings.mode !== 'off' ? ' on' : ''));
     panel.classList.toggle('collapsed', !!settings.collapsed);
+    panel.classList.toggle('mode-match', settings.mode === 'match');
     ui.collapse.textContent = settings.collapsed ? '+' : '–';
+    renderMatch();
+  }
+
+  /** A game is in progress on the page (stones on the board, not finished). */
+  function gameInProgress() {
+    const st = lastState;
+    return !!(st && st.stones > 0 && !st.gameOver && !st.notStarted);
   }
 
   function setMode(mode) {
+    if (settings.mode === 'match' && mode !== 'match' && gameInProgress()) {
+      setWarn('比赛进行中：本局结束后才能退出比赛模式');
+      return;
+    }
+    if (mode === 'match' && settings.mode !== 'match') {
+      matchHint = null;
+      // joining in the middle of a game: hints already seen in another mode are not counted
+      if (lastState) syncMatchGame(lastState, true);
+    }
     settings.mode = mode; saveSettings();
     invalidate();
     if (mode === 'off') { clearOverlays(); ui.move.textContent = '—'; }
@@ -1898,6 +1957,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
 
   function showHover(cell) {
     if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    if (settings.mode === 'match') { ui.hover.textContent = '\u00a0'; return; }
     const st = lastState;
     const r = +cell.dataset.row, c = +cell.dataset.col;
     const name = cellName({ row: r, col: c });
@@ -2011,6 +2071,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     if (!st.myColor) { clearOverlays(); setStatus('无法识别我方棋色', ''); return; }
     if (st.toMove === 0) { setWarn('棋子数量异常（黑' + st.black + ' 白' + st.white + '），等待同步'); return; }
     setWarn('');
+
+    if (settings.mode === 'match') { matchTick(st); return; }
 
     if (!st.myTurn) {
       const oa = oppAnalysis && oppAnalysis.key === st.key ? oppAnalysis : null;
@@ -2131,6 +2193,120 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     }
   }
 
+  // ------------------------------------------------------------------ match mode logic
+  function roomIdOf(st) {
+    if (st.kind !== 'online') return 'single';
+    const el = document.getElementById('room-id');
+    const m = el && /#\s*([\w-]+)/.exec(el.textContent || '');
+    return m ? m[1] : 'online';
+  }
+
+  /** Post a message in the game chat through the page's own chat box. Returns true if it was sent. */
+  function sendChat(text) {
+    const st = lastState;
+    if (!st || st.kind !== 'online') return false;
+    const input = document.getElementById('chat-input'), btn = document.getElementById('send-message');
+    if (!input || !btn) return false;
+    const draft = input.value;           // keep whatever the user was typing
+    input.value = text;
+    btn.click();                         // the page sends it (and applies its own mute rules)
+    const sent = input.value !== text;   // the page clears the box after sending
+    input.value = draft;
+    return sent;
+  }
+
+  /** Track which game the hint counter belongs to; a new game resets it. */
+  function syncMatchGame(st, joining) {
+    const room = roomIdOf(st);
+    const newGame = match.room !== room || (st.stones <= 1 && match.maxStones > 1) || joining;
+    if (newGame) {
+      match = { room, used: 0, oppUsed: 0, oppMatch: match.room === room && !(st.stones <= 1) ? match.oppMatch : false,
+        announced: false, maxStones: st.stones };
+      matchHint = null;
+      saveMatch();
+    } else if (st.stones > match.maxStones) { match.maxStones = st.stones; saveMatch(); }
+  }
+
+  /** Read the opponent's match-mode announcements from the game chat. */
+  let chatSocket = null;
+  function attachChat() {
+    const sock = window.socket;
+    if (!sock || sock === chatSocket || typeof sock.on !== 'function') return;
+    chatSocket = sock;
+    sock.on('chat-message', (data) => {
+      if (!data || typeof data.message !== 'string' || !data.message.startsWith(MATCH_PREFIX)) return;
+      if (data.playerId && sock.id && data.playerId === sock.id) return; // our own message
+      const msg = data.message;
+      if (/开启了?比赛模式|同意比赛模式/.test(msg)) {
+        match.oppMatch = true;
+        if (settings.mode !== 'match' && /开启了?比赛模式/.test(msg)) matchOffer = true;
+      }
+      const used = /已使用AI提示\s*(\d+)\s*\/\s*(\d+)/.exec(msg);
+      if (used) { match.oppMatch = true; match.oppUsed = Math.min(MATCH_LIMIT, +used[1]); }
+      saveMatch();
+      renderMatch();
+    });
+  }
+
+  function renderMatch() {
+    if (!ui.matchText) return;
+    ui.offer.classList.toggle('show', !!matchOffer && settings.mode !== 'match');
+    if (settings.mode !== 'match') return;
+    const st = lastState;
+    const left = MATCH_LIMIT - match.used;
+    const online = st && st.kind === 'online';
+    const opp = !online ? '' : match.oppMatch ? ' · 对方已用 ' + match.oppUsed + '/' + MATCH_LIMIT : ' · 尚未收到对方的比赛模式确认';
+    ui.matchText.textContent = '比赛模式：每方每局最多 ' + MATCH_LIMIT + ' 次 AI 提示 · 我方已用 ' + match.used + '/' + MATCH_LIMIT + opp;
+    const shown = matchHint && st && matchHint.key === st.key;
+    ui.matchBtn.disabled = !st || !st.myTurn || left <= 0 || busy || shown || st.gameOver;
+    ui.matchBtn.textContent = left <= 0 ? '本局 AI 提示已用完' : shown ? 'AI 建议已显示' : '求助 AI（剩 ' + left + ' 次）';
+  }
+
+  function matchTick(st) {
+    attachChat();
+    syncMatchGame(st, false);
+    if (st.kind === 'online' && !match.announced && st.myColor) {
+      if (sendChat(MATCH_PREFIX + '我开启了比赛模式：每方每局最多' + MATCH_LIMIT + '次AI提示，胜率实时显示')) { match.announced = true; saveMatch(); }
+    }
+    // only the hint that was paid for is drawn, nothing else
+    if (matchHint && matchHint.key === st.key) {
+      if (overlaysLost() || overlayEls.length === 0) drawOverlays(st, { key: st.key, side: 'me', color: st.myColor, best: matchHint.best, moves: null, pv: null });
+    } else { clearOverlays(); setAlert(''); }
+    if (!(matchHint && matchHint.key === st.key)) {
+      setStatus(st.myTurn ? '比赛模式 · 轮到我方' : '比赛模式 · 等待对手…', '胜率每手更新；需要时点“求助 AI”');
+      ui.move.textContent = '—';
+    }
+    quickEval(st, st.myTurn ? st.myColor : 3 - st.myColor);
+    renderMatch();
+  }
+
+  /** Spend one of the hints: compute and show the best move for this position. */
+  function requestMatchHint() {
+    const st = readState();
+    if (!st || !st.myTurn || settings.mode !== 'match' || busy) return;
+    syncMatchGame(st, false);
+    if (match.used >= MATCH_LIMIT || (matchHint && matchHint.key === st.key)) { renderMatch(); return; }
+    busy = true; renderSettings();
+    setStatus('AI 思考中…（比赛模式，第 ' + (match.used + 1) + '/' + MATCH_LIMIT + ' 次）');
+    request({ type: 'think', board: st.board, color: st.myColor, rule: st.rule, key: st.key, timeMs: settings.thinkMs }, null, settings.thinkMs)
+      .then((res) => {
+        busy = false;
+        if (!res.move) { renderSettings(); return; }
+        match.used += 1; saveMatch();
+        matchHint = { key: st.key, best: res };
+        const now = readState();
+        if (now && now.key === st.key) {
+          drawOverlays(now, { key: st.key, side: 'me', color: st.myColor, best: res, moves: null, pv: null });
+          ui.move.textContent = cellName(res.move);
+          setStatus('AI 建议：' + cellName(res.move) + '（第 ' + match.used + '/' + MATCH_LIMIT + ' 次提示）', '');
+        }
+        if (res.win !== null && res.win !== undefined) recordWin(st.stones, st.key, res.win);
+        sendChat(MATCH_PREFIX + '我已使用AI提示 ' + match.used + '/' + MATCH_LIMIT);
+        renderSettings();
+      })
+      .catch(() => { busy = false; renderSettings(); });
+  }
+
   /** Warnings derived from the opponent's analysis (their win rates). */
   function opponentAlert(oa) {
     const alive = oa.moves.filter(m => m.win > 0);
@@ -2183,14 +2359,27 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         .catch(() => { if (evalKey === st.key) evalKey = ''; });
       return;
     }
-    request({ type: 'evalPosition', board: st.board, color: opp, rule: st.rule, key: st.key,
-      // hint mode: same think time as on my turn, so both turns' estimates are
+    evalKey = '';
+    quickEval(st, opp);
+  }
+
+  /**
+   * Quick evaluation of the position for the side to move `color`, only for the
+   * live win rate (once per position). In match mode the engine's preferred move
+   * is never shown.
+   */
+  function quickEval(st, color) {
+    if (evalKey === st.key || st.pendingMove) return;
+    if (inFlight(() => true)) { schedule(150); return; }
+    evalKey = st.key;
+    request({ type: 'evalPosition', board: st.board, color, rule: st.rule, key: st.key,
+      // hint/match mode: same think time as on my turn, so both turns' estimates are
       // comparable; auto mode: keep it short so it never delays our own move
       timeMs: settings.mode === 'auto' ? Math.min(800, Math.max(300, Math.round(settings.thinkMs / 2))) : Math.min(2500, settings.thinkMs) }, null, 2500)
       .then((res) => {
         const pMe = st.myColor === 1 ? res.winBlack : 1 - res.winBlack;
         recordWin(st.stones, st.key, pMe); // valid for that position even if the game moved on
-        if (lastState && lastState.key === st.key && res.move) {
+        if (settings.mode !== 'match' && color !== st.myColor && lastState && lastState.key === st.key && res.move) {
           ui.info.textContent = '对方最佳应对预计: ' + cellName(res.move);
         }
         schedule(0);
@@ -2253,15 +2442,17 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return; // typing (e.g. chat)
       if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 'a' || e.key === 'A' || e.code === 'KeyA')) {
         e.preventDefault();
+        if (settings.mode === 'match') return; // no shortcut out of match mode
         setMode(settings.mode === 'auto' ? 'hint' : 'auto');
       }
     });
+    attachChat();
     schedule(300);
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.4.1',
-    debug: () => ({ analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
+    readState, setMode, settings, version: '1.5.0',
+    debug: () => ({ match, matchHint, analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

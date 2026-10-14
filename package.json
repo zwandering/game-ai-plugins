@@ -1,6 +1,6 @@
 {
   "name": "gomoku-ai-plugin",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "private": true,
   "description": "AI move assistant for gomoku.com (gomoku and renju): hints or auto-play.",
   "scripts": {
