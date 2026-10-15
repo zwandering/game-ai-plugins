@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gomoku AI 助手 (gomoku.com)
 // @namespace    https://github.com/local/gomoku-ai-plugin
-// @version      1.5.0
+// @version      1.6.0
 // @description  为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。
 // @match        https://gomoku.com/*
 // @match        https://www.gomoku.com/*
@@ -262,6 +262,11 @@ function createGomokuEngine() {
     /** Load a full board: flat array of 225 values or 15 rows of 15 (0 empty, 1 black, 2 white). */
     setBoard(arr) {
       const flat = Array.isArray(arr[0]) ? [].concat.apply([], arr) : arr;
+      // Same position as now: keep everything (transposition table included), so
+      // repeated requests on one position build on each other.
+      let same = this.history.length === 0;
+      for (let p = 0; p < N && same; p++) if ((flat[p] | 0) !== this.board[p]) same = false;
+      if (same) return;
       // Threat caches stay valid across positions, but they only help within one
       // game: drop them when the new board is not a continuation of the old one.
       for (let p = 0; p < N; p++) {
@@ -1177,7 +1182,7 @@ function createGomokuEngine() {
       }
       this.winning = saved;
       const pc = this.winRate(score, c); // P(c wins), c to move
-      return { move: r.move, score, reason: r.reason, winBlack: c === BLACK ? pc : 1 - pc };
+      return { move: r.move, score, reason: r.reason, depth: r.depth, nodes: r.nodes, winBlack: c === BLACK ? pc : 1 - pc };
     }
 
     firstEmpty() {
@@ -1236,8 +1241,40 @@ function createGomokuEngine() {
    */
   function makeHandler(post) {
     let engine = null, engineRule = null;
+    const cancelled = new Set();
+    let generation = 0; // bumped by 'cancelAll'
     return (msg) => {
       msg = msg || {};
+      if (msg.type === 'cancel') { cancelled.add(msg.id); return; }
+      if (msg.type === 'cancelAll') { generation++; return; }
+      if (msg.type === 'ponder') {
+        // Keep evaluating one position with doubling time budgets (results build
+        // on each other through the transposition table) until the position is
+        // decided, maxMs is used up, or the request is cancelled. Posts a
+        // 'ponder' progress message after every round.
+        try {
+          if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }
+          const id = msg.id, gen = generation, t0 = now(), maxMs = msg.maxMs || 600000;
+          let t = Math.max(200, msg.firstMs || 1000), round = 0;
+          const step = () => {
+            if (cancelled.has(id) || gen !== generation) { cancelled.delete(id); return; }
+            engine.setBoard(msg.board); // a no-op unless another request changed the position
+            const r = engine.evalPosition(msg.color, t);
+            const elapsed = Math.round(now() - t0);
+            round++;
+            post({ id, ok: true, progress: 'ponder', result: { move: r.move >= 0 ? rc(r.move) : null, score: r.score, reason: r.reason,
+              depth: r.depth, winBlack: r.winBlack, elapsed, round } });
+            const decided = REAL_SCORE[r.reason] && Math.abs(r.score) >= WIN_THRESHOLD;
+            if (decided || elapsed + 2 * t > maxMs) { post({ id, ok: true, result: { done: true, elapsed, round } }); return; }
+            t *= 2;
+            setTimeout(step, 0); // lets cancel messages in between rounds
+          };
+          step();
+        } catch (err) {
+          post({ id: msg.id, ok: false, error: String((err && err.stack) || err) });
+        }
+        return;
+      }
       if (msg.type === 'think') {
         try {
           if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }
@@ -1333,6 +1370,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   const DEFAULTS = {
     mode: 'hint', thinkMs: 1500, delayMs: 600, collapsed: false, x: null, y: null,
     showHeat: true, showPv: true, showOpp: true,
+    ponderMaxMs: 600000, // match mode: keep computing one position for at most this long
   };
   const HEAT_LABELS = 10; // candidate moves that get a number on the board (others get a dot)
 
@@ -1412,6 +1450,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   /** Abort everything the worker is doing (used when a long analysis became stale). */
   function restartWorker() {
     if (worker) { worker.terminate(); worker = null; }
+    if (inlineHandler) inlineHandler({ type: 'cancelAll' });
     rejectAll('cancelled');
   }
 
@@ -1813,6 +1852,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       setWarn('比赛进行中：本局结束后才能退出比赛模式');
       return;
     }
+    if (settings.mode === 'match' && mode !== 'match' && ponder) { ponder = null; pendingHintKey = null; restartWorker(); }
     if (mode === 'match' && settings.mode !== 'match') {
       matchHint = null;
       // joining in the middle of a game: hints already seen in another mode are not counted
@@ -2099,7 +2139,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
       return;
     }
 
-    if (inFlight(p => p.key !== st.key && (p.type === 'evalPosition' || p.type === 'analyze'))) {
+    if (inFlight(p => p.key !== st.key && (p.type === 'evalPosition' || p.type === 'analyze' || p.type === 'ponder'))) {
       // A stale opponent-turn evaluation is still running. Auto mode waits (it is
       // short and keeps the engine's caches); hint mode cancels it.
       if (settings.mode === 'auto') { schedule(100); return; }
@@ -2258,8 +2298,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     const opp = !online ? '' : match.oppMatch ? ' · 对方已用 ' + match.oppUsed + '/' + MATCH_LIMIT : ' · 尚未收到对方的比赛模式确认';
     ui.matchText.textContent = '比赛模式：每方每局最多 ' + MATCH_LIMIT + ' 次 AI 提示 · 我方已用 ' + match.used + '/' + MATCH_LIMIT + opp;
     const shown = matchHint && st && matchHint.key === st.key;
-    ui.matchBtn.disabled = !st || !st.myTurn || left <= 0 || busy || shown || st.gameOver;
-    ui.matchBtn.textContent = left <= 0 ? '本局 AI 提示已用完' : shown ? 'AI 建议已显示' : '求助 AI（剩 ' + left + ' 次）';
+    const waiting = st && pendingHintKey === st.key;
+    ui.matchBtn.disabled = !st || !st.myTurn || left <= 0 || busy || shown || waiting || st.gameOver;
+    ui.matchBtn.textContent = left <= 0 ? '本局 AI 提示已用完' : shown ? 'AI 建议已显示' : waiting ? 'AI 思考中…' : '求助 AI（剩 ' + left + ' 次）';
   }
 
   function matchTick(st) {
@@ -2272,39 +2313,89 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
     if (matchHint && matchHint.key === st.key) {
       if (overlaysLost() || overlayEls.length === 0) drawOverlays(st, { key: st.key, side: 'me', color: st.myColor, best: matchHint.best, moves: null, pv: null });
     } else { clearOverlays(); setAlert(''); }
-    if (!(matchHint && matchHint.key === st.key)) {
-      setStatus(st.myTurn ? '比赛模式 · 轮到我方' : '比赛模式 · 等待对手…', '胜率每手更新；需要时点“求助 AI”');
+    if (!(matchHint && matchHint.key === st.key) && pendingHintKey !== st.key) {
+      setStatus(ponderStatus(st), '胜率在下一手落下前持续计算、实时更新；需要时点“求助 AI”');
       ui.move.textContent = '—';
     }
-    quickEval(st, st.myTurn ? st.myColor : 3 - st.myColor);
+    startPonder(st, st.myTurn ? st.myColor : 3 - st.myColor);
     renderMatch();
   }
 
-  /** Spend one of the hints: compute and show the best move for this position. */
+  // ------------------------------------------------------------------ continuous computation (match mode)
+  // Until the next stone is played, the side to move's position is searched
+  // again and again with doubling time budgets; every round refines the live
+  // win rate. The move it finds is kept hidden (it serves a paid hint).
+  let ponder = null;          // { key, color, latest, done }
+  let pendingHintKey = null;  // a hint was requested before the first round finished
+
+  function ponderStatus(st) {
+    const base = st.myTurn ? '比赛模式 · 轮到我方' : '比赛模式 · 对方思考中';
+    const pd = ponder && ponder.key === st.key ? ponder : null;
+    if (!pd || !pd.latest) return base + ' · 计算中…';
+    const secs = Math.max(1, Math.round(pd.latest.elapsed / 1000));
+    return base + ' · ' + (pd.done ? '已算完' : '已持续计算') + ' ' + secs + ' 秒（深度 ' + pd.latest.depth + '）';
+  }
+
+  function startPonder(st, color) {
+    if (st.pendingMove) return;
+    if (ponder && ponder.key === st.key && ponder.color === color) return;
+    startWorker();
+    if (workerFailed) { quickEval(st, color); return; }  // no worker: a long search would freeze the page
+    // anything still running belongs to an older position
+    if (inFlight(p => p.key !== st.key)) restartWorker();
+    else if (inFlight(() => true)) { schedule(150); return; }
+    const pd = { key: st.key, color, latest: null, done: false };
+    ponder = pd;
+    const maxMs = Math.max(5000, settings.ponderMaxMs || 600000);
+    request({ type: 'ponder', board: st.board, color, rule: st.rule, key: st.key, firstMs: settings.thinkMs, maxMs },
+      (stage, res) => {
+        if (stage !== 'ponder' || ponder !== pd) return;
+        pd.latest = res;
+        const pMe = st.myColor === 1 ? res.winBlack : 1 - res.winBlack;
+        recordWin(st.stones, st.key, pMe);
+        if (pendingHintKey === st.key && color === st.myColor) { pendingHintKey = null; useMatchHint(st, res); }
+        if (lastState && lastState.key === st.key && !(matchHint && matchHint.key === st.key)) setStatus(ponderStatus(lastState));
+        renderMatch();
+      }, maxMs + 60000)
+      .then(() => { if (ponder === pd) { pd.done = true; if (lastState && lastState.key === st.key && !(matchHint && matchHint.key === st.key)) setStatus(ponderStatus(lastState)); } })
+      .catch(() => { if (ponder === pd) ponder = null; });
+  }
+
+  /**
+   * Spend one of the hints. The move comes from the continuous computation of
+   * this position (the deepest round so far), so the longer you think first,
+   * the stronger the hint; if no round has finished yet, the first one is used.
+   */
   function requestMatchHint() {
     const st = readState();
-    if (!st || !st.myTurn || settings.mode !== 'match' || busy) return;
+    if (!st || !st.myTurn || settings.mode !== 'match') return;
     syncMatchGame(st, false);
-    if (match.used >= MATCH_LIMIT || (matchHint && matchHint.key === st.key)) { renderMatch(); return; }
-    busy = true; renderSettings();
+    if (match.used >= MATCH_LIMIT || (matchHint && matchHint.key === st.key) || pendingHintKey === st.key) { renderMatch(); return; }
+    const pd = ponder && ponder.key === st.key && ponder.color === st.myColor ? ponder : null;
+    if (pd && pd.latest && pd.latest.move) { useMatchHint(st, pd.latest); return; }
+    pendingHintKey = st.key;
     setStatus('AI 思考中…（比赛模式，第 ' + (match.used + 1) + '/' + MATCH_LIMIT + ' 次）');
-    request({ type: 'think', board: st.board, color: st.myColor, rule: st.rule, key: st.key, timeMs: settings.thinkMs }, null, settings.thinkMs)
-      .then((res) => {
-        busy = false;
-        if (!res.move) { renderSettings(); return; }
-        match.used += 1; saveMatch();
-        matchHint = { key: st.key, best: res };
-        const now = readState();
-        if (now && now.key === st.key) {
-          drawOverlays(now, { key: st.key, side: 'me', color: st.myColor, best: res, moves: null, pv: null });
-          ui.move.textContent = cellName(res.move);
-          setStatus('AI 建议：' + cellName(res.move) + '（第 ' + match.used + '/' + MATCH_LIMIT + ' 次提示）', '');
-        }
-        if (res.win !== null && res.win !== undefined) recordWin(st.stones, st.key, res.win);
-        sendChat(MATCH_PREFIX + '我已使用AI提示 ' + match.used + '/' + MATCH_LIMIT);
-        renderSettings();
-      })
-      .catch(() => { busy = false; renderSettings(); });
+    if (workerFailed) {
+      // no continuous computation without a worker: one ordinary search
+      request({ type: 'think', board: st.board, color: st.myColor, rule: st.rule, key: st.key, timeMs: settings.thinkMs }, null, settings.thinkMs)
+        .then((res) => { if (pendingHintKey === st.key) { pendingHintKey = null; useMatchHint(st, res); } renderMatch(); })
+        .catch(() => { if (pendingHintKey === st.key) pendingHintKey = null; renderMatch(); });
+    } else if (!pd) startPonder(st, st.myColor);
+    renderMatch();
+  }
+
+  function useMatchHint(st, res) {
+    if (!res.move) return;
+    const now = readState();
+    if (!now || now.key !== st.key || !now.myTurn) return; // the position changed meanwhile: nothing spent
+    match.used += 1; saveMatch();
+    matchHint = { key: st.key, best: res };
+    drawOverlays(now, { key: st.key, side: 'me', color: st.myColor, best: res, moves: null, pv: null });
+    ui.move.textContent = cellName(res.move);
+    const secs = Math.max(1, Math.round((res.elapsed || 0) / 1000));
+    setStatus('AI 建议：' + cellName(res.move) + '（第 ' + match.used + '/' + MATCH_LIMIT + ' 次提示 · 基于 ' + secs + ' 秒计算，深度 ' + res.depth + '）', '');
+    sendChat(MATCH_PREFIX + '我已使用AI提示 ' + match.used + '/' + MATCH_LIMIT);
+    renderMatch();
   }
 
   /** Warnings derived from the opponent's analysis (their win rates). */
@@ -2421,9 +2512,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
         }
         // A position change makes a running (long) analysis useless: cancel it
         // (mine or the opponent's).
-        if (inFlight(p => p.type === 'analyze')) {
+        if (inFlight(p => p.type === 'analyze' || p.type === 'ponder')) {
           const st = readState();
-          if (st && inFlight(p => p.type === 'analyze' && p.key !== st.key)) {
+          if (st && inFlight(p => (p.type === 'analyze' || p.type === 'ponder') && p.key !== st.key)) {
+            if (ponder && ponder.key !== st.key) ponder = null;
             if (busy && analysis && !analysis.done && analysis.key !== st.key) { busy = false; analysis = null; lastKey = ''; }
             restartWorker();
           }
@@ -2451,8 +2543,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = createGomo
   }
 
   window.__gomokuAI = {
-    readState, setMode, settings, version: '1.5.0',
-    debug: () => ({ match, matchHint, analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
+    readState, setMode, settings, version: '1.6.0',
+    debug: () => ({ match, matchHint, ponder, analysis, history: history.map(h => h && Math.round(h.pMe * 1000) / 1000), lastKey, busy }),
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

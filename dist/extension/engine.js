@@ -252,6 +252,11 @@ function createGomokuEngine() {
     /** Load a full board: flat array of 225 values or 15 rows of 15 (0 empty, 1 black, 2 white). */
     setBoard(arr) {
       const flat = Array.isArray(arr[0]) ? [].concat.apply([], arr) : arr;
+      // Same position as now: keep everything (transposition table included), so
+      // repeated requests on one position build on each other.
+      let same = this.history.length === 0;
+      for (let p = 0; p < N && same; p++) if ((flat[p] | 0) !== this.board[p]) same = false;
+      if (same) return;
       // Threat caches stay valid across positions, but they only help within one
       // game: drop them when the new board is not a continuation of the old one.
       for (let p = 0; p < N; p++) {
@@ -1167,7 +1172,7 @@ function createGomokuEngine() {
       }
       this.winning = saved;
       const pc = this.winRate(score, c); // P(c wins), c to move
-      return { move: r.move, score, reason: r.reason, winBlack: c === BLACK ? pc : 1 - pc };
+      return { move: r.move, score, reason: r.reason, depth: r.depth, nodes: r.nodes, winBlack: c === BLACK ? pc : 1 - pc };
     }
 
     firstEmpty() {
@@ -1226,8 +1231,40 @@ function createGomokuEngine() {
    */
   function makeHandler(post) {
     let engine = null, engineRule = null;
+    const cancelled = new Set();
+    let generation = 0; // bumped by 'cancelAll'
     return (msg) => {
       msg = msg || {};
+      if (msg.type === 'cancel') { cancelled.add(msg.id); return; }
+      if (msg.type === 'cancelAll') { generation++; return; }
+      if (msg.type === 'ponder') {
+        // Keep evaluating one position with doubling time budgets (results build
+        // on each other through the transposition table) until the position is
+        // decided, maxMs is used up, or the request is cancelled. Posts a
+        // 'ponder' progress message after every round.
+        try {
+          if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }
+          const id = msg.id, gen = generation, t0 = now(), maxMs = msg.maxMs || 600000;
+          let t = Math.max(200, msg.firstMs || 1000), round = 0;
+          const step = () => {
+            if (cancelled.has(id) || gen !== generation) { cancelled.delete(id); return; }
+            engine.setBoard(msg.board); // a no-op unless another request changed the position
+            const r = engine.evalPosition(msg.color, t);
+            const elapsed = Math.round(now() - t0);
+            round++;
+            post({ id, ok: true, progress: 'ponder', result: { move: r.move >= 0 ? rc(r.move) : null, score: r.score, reason: r.reason,
+              depth: r.depth, winBlack: r.winBlack, elapsed, round } });
+            const decided = REAL_SCORE[r.reason] && Math.abs(r.score) >= WIN_THRESHOLD;
+            if (decided || elapsed + 2 * t > maxMs) { post({ id, ok: true, result: { done: true, elapsed, round } }); return; }
+            t *= 2;
+            setTimeout(step, 0); // lets cancel messages in between rounds
+          };
+          step();
+        } catch (err) {
+          post({ id: msg.id, ok: false, error: String((err && err.stack) || err) });
+        }
+        return;
+      }
       if (msg.type === 'think') {
         try {
           if (!engine || engineRule !== msg.rule) { engine = new Engine({ rule: msg.rule }); engineRule = msg.rule; }

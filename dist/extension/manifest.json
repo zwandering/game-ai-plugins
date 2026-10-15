@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gomoku AI 助手 (gomoku.com)",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "为 gomoku.com 五子棋/连珠提供 AI 落子提示或自动下棋。",
   "content_scripts": [
     {
