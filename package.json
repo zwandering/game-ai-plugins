@@ -1,0 +1,14 @@
+{
+  "name": "wikiracing-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "wikiracing.org 寻路助手：提示当前页面该点哪个链接",
+  "scripts": {
+    "build": "node build.js",
+    "test": "node test/unit.js",
+    "sim": "node test/sim.js"
+  },
+  "devDependencies": {
+    "linkedom": "^0.18.5"
+  }
+}

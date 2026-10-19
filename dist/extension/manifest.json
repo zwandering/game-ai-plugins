@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "WikiRace 助手 (wikiracing.org)",
+  "version": "0.1.0",
+  "description": "在 wikiracing.org 上提示当前页面该点哪个链接：直达 / 2 步 / 3 步路线和相关度排序。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://wikiracing.org/*",
+        "https://www.wikiracing.org/*"
+      ],
+      "js": [
+        "core.js",
+        "ui.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
