@@ -33,7 +33,8 @@ node build.js
 |---|---|
 | 点面板里的条目 | 滚动到文章里的这个链接 |
 | `Alt+J` | 依次跳到第 1、2、3… 个推荐链接 |
-| `Alt+W` | 显示 / 隐藏面板 |
+| 面板右上角 ✕ | 把面板缩成角落里的 🧭 按钮，点 🧭 恢复 |
+| `Alt+W` | 在面板和 🧭 按钮之间切换 |
 | “改” | 手动输入目标（识别不到目标时用；留空回车恢复自动识别） |
 | “高亮文章内链接” | 关掉后只看面板，不改文章外观 |
 
@@ -66,6 +67,7 @@ node build.js
 ```bash
 npm install          # 只为测试装 linkedom
 node test/unit.js    # 离线单元测试（清洗规则、调度器、伪造的小维基上的寻路）
+google-chrome --headless=new --dump-dom --virtual-time-budget=8000 "file://$PWD/test/ui-hidden.html" | grep RESULT   # 面板隐藏/恢复
 node test/sim.js     # 在线模拟：每步都点排第一的链接，统计步数
 node test/sim.js "Pogo stick" "Rafflesia" --think 2000
 ```

@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- 无头 Chrome 冒烟测试：面板隐藏时只剩 🧭 按钮，点它能恢复。
+     google-chrome --headless=new --dump-dom --virtual-time-budget=8000 file://$PWD/test/ui-hidden.html | grep RESULT -->
+<html><head><meta charset="utf-8"><title>ui test</title></head>
+<body>
+<div class="game-page"><span class="timer-goal-text">Goal: Music</span>
+  <div class="wiki-article"><h1 class="wiki-title">Tiramisu</h1>
+    <div class="wiki-content"><div class="mw-parser-output">
+      <p><a href="/wiki/Italy">Italy</a> <a href="/wiki/Coffee">Coffee</a> <a href="/wiki/Dessert">Dessert</a></p>
+    </div></div>
+  </div>
+</div>
+<pre id="out">RESULT pending</pre>
+<script>
+  localStorage.setItem('wikiraceHelper.settings.v1', JSON.stringify({ highlight: true, hidden: true }));
+</script>
+<script src="../dist/extension/core.js"></script>
+<script src="../dist/extension/ui.js"></script>
+<script>
+  const vis = el => el && getComputedStyle(el).display !== 'none';
+  setTimeout(() => {
+    const host = document.querySelector('.wrh-ignore');
+    const sh = host && host.shadowRoot;
+    const r = { host: vis(host), pillWhenHidden: vis(sh.querySelector('.pill')), panelWhenHidden: vis(sh.querySelector('.panel')) };
+    sh.querySelector('.pill').click();
+    r.pillAfterClick = vis(sh.querySelector('.pill'));
+    r.panelAfterClick = vis(sh.querySelector('.panel'));
+    r.saved = JSON.parse(localStorage.getItem('wikiraceHelper.settings.v1')).hidden;
+    sh.querySelector('.close').click();
+    r.pillAfterClose = vis(sh.querySelector('.pill'));
+    const ok = r.host && r.pillWhenHidden && !r.panelWhenHidden && !r.pillAfterClick && r.panelAfterClick && r.saved === false && r.pillAfterClose;
+    document.getElementById('out').textContent = 'RESULT ' + (ok ? 'PASS ' : 'FAIL ') + JSON.stringify(r);
+  }, 1000);
+</script>
+</body></html>

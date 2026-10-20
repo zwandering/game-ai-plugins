@@ -796,10 +796,18 @@
       input[type=text] { width: 100%; box-sizing: border-box; padding: 4px 6px; border: 1px solid #9ca3af; border-radius: 5px;
         font: inherit; background: transparent; color: inherit; }
       .err { color: #dc2626; }
+      .pill { all: unset; display: none; cursor: pointer; width: 38px; height: 38px; border-radius: 50%; text-align: center;
+        line-height: 38px; font-size: 20px; background: linear-gradient(135deg, #6b21a8, #2563eb);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, .25); }
+      .pill:hover { filter: brightness(1.15); }
+      .hidden .panel { display: none; }
+      .hidden .pill { display: block; }
     </style>
+    <div class="root">
+    <button class="pill" title="显示 WikiRace 助手（Alt+W）">🧭</button>
     <div class="panel">
       <div class="head"><span class="t">🧭 WikiRace 助手</span>
-        <button class="collapse" title="折叠">▁</button><button class="close" title="隐藏（Alt+W 重新打开）">✕</button></div>
+        <button class="collapse" title="折叠">▁</button><button class="close" title="缩成角落里的 🧭 按钮（Alt+W 切换）">✕</button></div>
       <div class="body">
         <div class="target"><span class="muted">目标</span><b class="tname">—</b><button class="edit">改</button></div>
         <div class="editbox" hidden><input type="text" placeholder="输入目标条目名，回车确认（留空恢复自动识别）"></div>
@@ -810,6 +818,7 @@
           <span class="muted">Alt+W 显隐 · Alt+J 下一个</span>
         </div>
       </div>
+    </div>
     </div>`;
   const $ = s => shadow.querySelector(s);
   const panel = $('.panel');
@@ -817,6 +826,7 @@
   $('.hl').addEventListener('change', e => { settings.highlight = e.target.checked; saveSettings(); highlight(lastResult); });
   $('.collapse').addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); applyLayout(); });
   $('.close').addEventListener('click', () => { settings.hidden = true; saveSettings(); applyLayout(); });
+  $('.pill').addEventListener('click', () => { settings.hidden = false; saveSettings(); applyLayout(); });
   $('.edit').addEventListener('click', () => {
     const box = $('.editbox');
     box.hidden = !box.hidden;
@@ -854,7 +864,9 @@
   let visible = false;
   function setVisible(v) { visible = v; applyLayout(); }
   function applyLayout() {
-    host.style.display = visible && !settings.hidden ? '' : 'none';
+    // 隐藏时不完全消失，留一个 🧭 按钮，否则用户找不回面板
+    host.style.display = visible ? '' : 'none';
+    $('.root').classList.toggle('hidden', !!settings.hidden);
     panel.classList.toggle('collapsed', settings.collapsed);
     if (settings.x != null && settings.y != null) {
       host.style.left = Math.min(settings.x, window.innerWidth - 60) + 'px';
