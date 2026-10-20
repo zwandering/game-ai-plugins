@@ -58,6 +58,30 @@ test('调度器：优先级先行、每分钟上限', async () => {
   assert.strictEqual(capped.stats().queued, 1);
 });
 
+test('调度器：后台额度用完时，前台请求仍然立即发出', async () => {
+  const s = core.makeScheduler(3, 10, 2);
+  const ran = [];
+  for (let i = 0; i < 4; i++) s.run(async () => { ran.push('bg' + i); }, 2);
+  await new Promise(r => setTimeout(r, 30));
+  assert.deepStrictEqual(ran, ['bg0', 'bg1']);
+  await s.run(async () => { ran.push('fg'); }, 0);
+  assert.deepStrictEqual(ran, ['bg0', 'bg1', 'fg']);
+  assert.strictEqual(s.stats().queued, 2, '后台任务继续等窗口');
+});
+
+test('调度器：换页后，旧页面还没发出的请求被丢弃', async () => {
+  const s = core.makeScheduler(1, 100);
+  const sig = { aborted: false };
+  const ran = [];
+  const slow = s.run(() => new Promise(r => setTimeout(() => { ran.push('slow'); r(); }, 20)), 0);
+  const stale = s.run(async () => { ran.push('stale'); }, 0, sig).catch(e => e.message);
+  sig.aborted = true;
+  const fresh = s.run(async () => { ran.push('fresh'); }, 0);
+  await Promise.all([slow, fresh]);
+  assert.strictEqual(await stale, 'aborted');
+  assert.deepStrictEqual(ran, ['slow', 'fresh']);
+});
+
 // ---- 伪造的 Wikipedia ----
 // Start → A(以及重定向写法 Arel) / B / C ；A → P → T（3 步）；B 只在 navbox 里链接 T；C 链接 T 的重定向 Tr。
 const PAGES = {

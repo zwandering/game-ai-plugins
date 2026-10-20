@@ -295,7 +295,9 @@
     parts.push(st.backlinksDone ? `反链 ${fmt(st.B1.size)}${st.backlinksTruncated ? '+' : ''}` : `反链加载中 ${fmt(st.B1.size)}${total}`);
     if (st.b2Total) parts.push(st.b2Done < st.b2Total ? `外圈 ${st.b2Done}/${st.b2Total}` : `外圈 ${fmt(st.B2.size)}`);
     if (lastResult && lastResult.budget) parts.push(lastResult.done ? '前瞻完成' : `前瞻 ${lastResult.evaluated}/${lastResult.budget}`);
-    parts.push(`${solver.stats().lastMinute} 请求/分`);
+    const ss = solver.stats();
+    if (ss.waitMs > 1000) parts.push(`限速等待 ${Math.ceil(ss.waitMs / 1000)}s`);
+    parts.push(`${ss.lastMinute} 请求/分`);
     $('.status').textContent = parts.join(' · ');
     $('.status').classList.remove('err');
   }
@@ -369,6 +371,6 @@
     if (muts.every(m => host.contains(m.target) || m.target === host)) return;
     schedule();
   }).observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(() => { if (lastResult) renderStatus(); }, 2000);
+  setInterval(() => { if (targetState && visible) renderStatus(); }, 1000);
   schedule();
 })();

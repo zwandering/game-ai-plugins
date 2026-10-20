@@ -48,6 +48,8 @@
   const DEFAULTS = {
     concurrency: 3,         // 同时进行的 Wikipedia 请求数
     perMinute: 150,         // 每分钟请求上限（官方限额 200，给游戏自己的请求留余量）
+    backgroundPerMinute: 110, // 其中后台加载反链 / 外圈最多用这么多，剩下的（约两页的量）留给当前页面
+    backgroundIntervalMs: 400, // 后台请求之间的最小间隔
     evalBudget: 10,         // 每个页面最多前瞻多少个候选
     verifyPerCandidate: 2,  // 每个 3 步候选最多验证几个中转页
     verifyCandidates: 4,    // 最多给几个候选做 3 步验证
@@ -128,37 +130,68 @@
 
   /* 请求调度：Wikimedia 对浏览器匿名用户的限额是 200 次/分钟、建议并发 ≤3
    * （https://www.mediawiki.org/wiki/Wikimedia_APIs/Rate_limits）。
-   * 这里按优先级排队，滑动窗口控制每分钟请求数，遇到 429 全局暂停。 */
-  function makeScheduler(concurrency, perMinute) {
+   * 这里按优先级排队，滑动窗口控制每分钟请求数，遇到 429 全局暂停。
+   * 后台任务（prio >= 2）每分钟最多 bgPerMinute 次，其余额度留给当前页面——
+   * 否则开局加载反链会把窗口占满，跳到下一页后的前瞻要干等将近一分钟。
+   * 后台任务还要匀速发出（间隔 bgIntervalMs），突发请求容易被服务器 429，而 429 会让所有请求一起暂停。
+   * 带 signal 的任务在发出前若已 aborted（用户已经换页），直接丢弃。 */
+  function makeScheduler(concurrency, perMinute, bgPerMinute, bgIntervalMs) {
+    if (bgPerMinute == null) bgPerMinute = perMinute;
+    bgIntervalMs = bgIntervalMs || 0;
+    let lastBgStart = 0;
     let active = 0;
     let pausedUntil = 0;
+    let waitingUntil = 0;
     let timer = null;
     const starts = [];
-    const queue = [];   // {fn, prio, seq, resolve, reject}
+    const queue = [];   // {fn, prio, seq, signal, resolve, reject}
     let seq = 0;
     const pump = () => {
       timer = null;
+      waitingUntil = 0;
       for (;;) {
+        for (let i = queue.length - 1; i >= 0; i--) {
+          if (queue[i].signal && queue[i].signal.aborted) queue.splice(i, 1)[0].reject(new Error('aborted'));
+        }
         if (active >= concurrency || !queue.length) return;
         const now = Date.now();
         while (starts.length && now - starts[0] >= 60000) starts.shift();
-        let wait = pausedUntil - now;
-        if (starts.length >= perMinute) wait = Math.max(wait, 60000 - (now - starts[0]));
-        if (wait > 0) { if (!timer) timer = setTimeout(pump, wait + 5); return; }
         let bi = 0;
         for (let i = 1; i < queue.length; i++) {
           if (queue[i].prio < queue[bi].prio || (queue[i].prio === queue[bi].prio && queue[i].seq < queue[bi].seq)) bi = i;
         }
+        const cap = queue[bi].prio >= 2 ? bgPerMinute : perMinute;
+        let wait = pausedUntil - now;
+        if (starts.length >= cap) wait = Math.max(wait, 60000 - (now - starts[starts.length - cap]));
+        if (queue[bi].prio >= 2) wait = Math.max(wait, lastBgStart + bgIntervalMs - now);
+        if (wait > 0) {
+          waitingUntil = now + wait;
+          if (!timer) timer = setTimeout(pump, wait + 5);
+          return;
+        }
         const job = queue.splice(bi, 1)[0];
+        if (job.prio >= 2) lastBgStart = now;
         active++;
         starts.push(now);
         Promise.resolve().then(job.fn).then(job.resolve, job.reject).finally(() => { active--; pump(); });
       }
     };
     return {
-      run(fn, prio) { return new Promise((resolve, reject) => { queue.push({ fn, prio: prio || 0, seq: seq++, resolve, reject }); pump(); }); },
+      run(fn, prio, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ fn, prio: prio || 0, seq: seq++, signal, resolve, reject });
+          // 新来的高优先级任务可能不受后台额度限制，不要等旧的定时器
+          if (timer) { clearTimeout(timer); timer = null; }
+          pump();
+        });
+      },
       pause(ms) { pausedUntil = Math.max(pausedUntil, Date.now() + ms); },
-      stats() { const now = Date.now(); return { queued: queue.length, active, lastMinute: starts.filter(t => now - t < 60000).length }; },
+      stats() {
+        const now = Date.now();
+        const fg = queue.filter(j => j.prio < 2).length;
+        return { queued: queue.length, queuedForeground: fg, active, lastMinute: starts.filter(t => now - t < 60000).length,
+          waitMs: fg && waitingUntil > now ? waitingUntil - now : 0 };
+      },
     };
   }
 
@@ -170,12 +203,12 @@
 
   function createSolver(env) {
     const opts = Object.assign({}, DEFAULTS, env.options || {});
-    const sched = makeScheduler(opts.concurrency, opts.perMinute);
+    const sched = makeScheduler(opts.concurrency, opts.perMinute, opts.backgroundPerMinute, opts.backgroundIntervalMs);
     let requestCount = 0;
     // prio: 0 当前这一步，1 验证/目标信息，2 后台反链。
-    const fetchJSON = async (url, prio) => {
+    const fetchJSON = async (url, prio, signal) => {
       for (let attempt = 0; ; attempt++) {
-        const r = await sched.run(() => { requestCount++; return env.fetch(url); }, prio);
+        const r = await sched.run(() => { requestCount++; return env.fetch(url); }, prio, signal);
         if (r.ok) return r.json();
         if ((r.status === 429 || r.status >= 500) && attempt < 4) {
           const ra = parseFloat(r.headers && r.headers.get && r.headers.get('retry-after'));
@@ -198,18 +231,18 @@
       redirects: 'true', maxage: '900', smaxage: '3600', uselang: 'content',
     }).toString();
 
-    function parsePage(lang, title, prio) {
+    function parsePage(lang, title, prio, signal) {
       const key = lang + '|' + title;
       let p = parseCache.get(key);
       if (!p) {
-        p = fetchJSON(parseURL(lang, title), prio || 0).then(j => {
+        p = fetchJSON(parseURL(lang, title), prio || 0, signal).then(j => {
           if (!j || !j.parse) throw new Error('parse failed: ' + title);
           const html = typeof j.parse.text === 'string' ? j.parse.text : j.parse.text['*'];
           const doc = env.parseHTML('<!doctype html><html><body><div id="wrh-root">' + html + '</div></body></html>');
           const rootEl = doc.getElementById('wrh-root') || doc.body;
           return { title: normTitle(j.parse.title), links: extractVisibleLinks(rootEl) };
         });
-        p.catch(() => parseCache.m.delete(key));
+        p.catch(() => { if (parseCache.m.get(key) === p) parseCache.m.delete(key); });
         parseCache.set(key, p);
       }
       return p;
@@ -464,6 +497,13 @@
         return best.c;
       };
 
+      // 旧页面排队的同名请求会因换页被丢弃（'aborted'），这时自己再请求一次。
+      const getPage = async (title, prio) => {
+        try { return await parsePage(lang, title, prio, signal); } catch (e) {
+          if (e.message === 'aborted' && !signal.aborted) return parsePage(lang, title, prio, signal);
+          throw e;
+        }
+      };
       let started = 0;
       const worker = async () => {
         for (;;) {
@@ -473,7 +513,7 @@
           started++;
           c.inflight = true;
           try {
-            const page = await parsePage(lang, c.canon);
+            const page = await getPage(c.canon, 0);
             let direct = false;
             const via = [];
             let ot = 0, v2 = 0;
@@ -513,7 +553,7 @@
           for (const p of c.via.slice(0, opts.verifyPerCandidate)) {
             if (signal.aborted) return;
             try {
-              const page = await parsePage(lang, p, 1);
+              const page = await getPage(p, 1);
               if ([...page.links.keys()].some(t => isTarget(st, t))) ok.push(p);
             } catch (e) { /* ignore */ }
           }
@@ -836,7 +876,9 @@
     parts.push(st.backlinksDone ? `反链 ${fmt(st.B1.size)}${st.backlinksTruncated ? '+' : ''}` : `反链加载中 ${fmt(st.B1.size)}${total}`);
     if (st.b2Total) parts.push(st.b2Done < st.b2Total ? `外圈 ${st.b2Done}/${st.b2Total}` : `外圈 ${fmt(st.B2.size)}`);
     if (lastResult && lastResult.budget) parts.push(lastResult.done ? '前瞻完成' : `前瞻 ${lastResult.evaluated}/${lastResult.budget}`);
-    parts.push(`${solver.stats().lastMinute} 请求/分`);
+    const ss = solver.stats();
+    if (ss.waitMs > 1000) parts.push(`限速等待 ${Math.ceil(ss.waitMs / 1000)}s`);
+    parts.push(`${ss.lastMinute} 请求/分`);
     $('.status').textContent = parts.join(' · ');
     $('.status').classList.remove('err');
   }
@@ -910,6 +952,6 @@
     if (muts.every(m => host.contains(m.target) || m.target === host)) return;
     schedule();
   }).observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(() => { if (lastResult) renderStatus(); }, 2000);
+  setInterval(() => { if (targetState && visible) renderStatus(); }, 1000);
   schedule();
 })();
