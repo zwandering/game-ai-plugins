@@ -591,10 +591,12 @@
   const SHOW_TOP = 8;
   const SETTINGS_KEY = 'wikiraceHelper.settings.v1';
   const TIER_LABEL = { 0: '直达', 1: '2 步', 2: '3 步' };
+  const MATCH_ASKS = 1;   // 比赛模式每局能询问的次数
+  const USED_KEY = 'wikiraceHelper.matchUsed.';
 
   const settings = loadSettings();
   function loadSettings() {
-    const d = { highlight: true, collapsed: false, hidden: false, x: null, y: null };
+    const d = { highlight: true, collapsed: false, hidden: false, x: null, y: null, mode: 'hint' };
     try { return Object.assign(d, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); } catch (e) { return d; }
   }
   function saveSettings() {
@@ -638,6 +640,31 @@
   let anchorsByTitle = new Map();
   let reevalTimer = null;
   let lastEmitSig = '';
+  let revealedPageKey = '';   // 比赛模式下，本页已经用询问揭晓过
+  let inGame = false;         // 正在一局里（有文章、还没到达目标）
+
+  // ---------- 比赛模式：每局只能询问 MATCH_ASKS 次 ----------
+  // 次数存在 sessionStorage 里，刷新页面不会重置；到达目标后清零。
+  const isMatch = () => settings.mode === 'match';
+  const revealed = () => !isMatch() || (pageKey !== '' && revealedPageKey === pageKey);
+  function usedAsks() {
+    try { return +(sessionStorage.getItem(USED_KEY + gameKey) || 0); } catch (e) { return 0; }
+  }
+  function setUsedAsks(n) {
+    try { if (n) sessionStorage.setItem(USED_KEY + gameKey, String(n)); else sessionStorage.removeItem(USED_KEY + gameKey); } catch (e) { /* ignore */ }
+  }
+  function ask() {
+    if (!isMatch() || revealed() || !gameKey || usedAsks() >= MATCH_ASKS) return;
+    setUsedAsks(usedAsks() + 1);
+    revealedPageKey = pageKey;
+    showResult();
+  }
+  function showResult() {
+    renderModes();
+    if (!revealed()) { clearHighlights(); renderLocked(); renderStatus(); return; }
+    renderList(lastResult);
+    highlight(lastResult);
+  }
 
   function onTargetChange(st) {
     renderStatus();
@@ -657,7 +684,12 @@
 
   function tick() {
     const g = readGame();
-    if (!g || !g.target) { setVisible(!!g); if (g && !g.target) renderNeedTarget(); return; }
+    if (!g || !g.target) {
+      if (inGame) { inGame = false; renderModes(); }
+      setVisible(!!g);
+      if (g && !g.target) renderNeedTarget();
+      return;
+    }
     setVisible(true);
     const gk = g.lang + '|' + g.target + '|' + g.start;
     if (gk !== gameKey) {
@@ -667,6 +699,9 @@
       targetState = solver.setTarget(g.lang, g.target, onTargetChange);
       targetState.ready.catch(err => renderError('目标加载失败：' + err.message));
     }
+    const reached = !!(targetState && g.current && targetState.R.has(g.current));
+    if (reached && usedAsks()) setUsedAsks(0);   // 这一局结束，下一局（哪怕同一条路线）重新计数
+    if (inGame !== !reached) { inGame = !reached; renderModes(); }
     const links = core.collectLinks(g.article, a => a.classList.contains('wiki-inert-link') || !!a.closest('.wrh-ignore'));
     const pk = gk + '|' + g.current + '|' + links.size;
     if (pk === pageKey) return;
@@ -678,12 +713,12 @@
     const mySignal = signal = { aborted: false };
     lastResult = null;
     clearHighlights();
-    renderList(null, g);
+    showResult();
     const list = [...links].map(([title, info]) => Object.assign({ title }, info));
     solver.evaluate(g.lang, g.current, list, {
       signal: mySignal,
       visited,
-      onUpdate: res => { if (!mySignal.aborted) { lastResult = res; renderList(res, g); highlight(res); } },
+      onUpdate: res => { if (!mySignal.aborted) { lastResult = res; if (revealed()) { renderList(res); highlight(res); } else renderStatus(); } },
     }).catch(err => { if (!mySignal.aborted) renderError('计算失败：' + err.message); });
   }
 
@@ -802,6 +837,14 @@
       .pill:hover { filter: brightness(1.15); }
       .hidden .panel { display: none; }
       .hidden .pill { display: block; }
+      .modes { display: flex; margin: 2px 0 6px; border: 1px solid #c4b5fd; border-radius: 7px; overflow: hidden; }
+      .modes button { all: unset; flex: 1; text-align: center; padding: 3px 0; cursor: pointer; font-size: 12px; }
+      .modes button.on { background: #6b21a8; color: #fff; font-weight: 600; }
+      .modes button:disabled { cursor: not-allowed; opacity: .45; }
+      .locked { padding: 10px 4px 4px; text-align: center; }
+      .ask { all: unset; display: inline-block; margin-top: 8px; padding: 6px 16px; border-radius: 7px; cursor: pointer;
+        background: linear-gradient(90deg, #6b21a8, #2563eb); color: #fff; font-weight: 600; }
+      .ask:disabled { cursor: not-allowed; background: #9ca3af; }
     </style>
     <div class="root">
     <button class="pill" title="显示 WikiRace 助手（Alt+W）">🧭</button>
@@ -810,6 +853,7 @@
         <button class="collapse" title="折叠">▁</button><button class="close" title="缩成角落里的 🧭 按钮（Alt+W 切换）">✕</button></div>
       <div class="body">
         <div class="target"><span class="muted">目标</span><b class="tname">—</b><button class="edit">改</button></div>
+        <div class="modes"><button data-mode="hint">提示</button><button data-mode="match">比赛（每局 1 次）</button></div>
         <div class="editbox" hidden><input type="text" placeholder="输入目标条目名，回车确认（留空恢复自动识别）"></div>
         <div class="status muted">等待对局…</div>
         <ol class="list"></ol>
@@ -822,8 +866,16 @@
     </div>`;
   const $ = s => shadow.querySelector(s);
   const panel = $('.panel');
+  renderModes();
   $('.hl').checked = settings.highlight;
-  $('.hl').addEventListener('change', e => { settings.highlight = e.target.checked; saveSettings(); highlight(lastResult); });
+  $('.hl').addEventListener('change', e => { settings.highlight = e.target.checked; saveSettings(); highlight(revealed() ? lastResult : null); });
+  $('.modes').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b || b.disabled || b.dataset.mode === settings.mode) return;
+    settings.mode = b.dataset.mode;
+    saveSettings();
+    showResult();
+  });
   $('.collapse').addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); applyLayout(); });
   $('.close').addEventListener('click', () => { settings.hidden = true; saveSettings(); applyLayout(); });
   $('.pill').addEventListener('click', () => { settings.hidden = false; saveSettings(); applyLayout(); });
@@ -842,6 +894,7 @@
     tick();
   });
   $('.list').addEventListener('click', e => {
+    if (e.target.closest('.ask')) { ask(); return; }
     const li = e.target.closest('.item');
     if (li && lastResult) jumpTo(lastResult.ranked[+li.dataset.idx]);
   });
@@ -913,7 +966,7 @@
     return bits.join('，') || (c.evaluated ? '' : '未前瞻');
   }
 
-  function renderList(res, g) {
+  function renderList(res) {
     renderStatus();
     const ol = $('.list');
     if (!res) { ol.innerHTML = '<li class="muted">计算中…</li>'; return; }
@@ -928,6 +981,21 @@
         <span class="name"><b>${esc(c.title)}</b>${anchor}${p ? `<span class="path muted">${esc(p)}</span>` : ''}</span>
         ${tagFor(c)}</li>`;
     }).join('');
+  }
+
+  function renderModes() {
+    for (const b of shadow.querySelectorAll('.modes button')) {
+      b.classList.toggle('on', b.dataset.mode === settings.mode);
+      // 比赛进行中不能退回提示模式，到达目标或离开对局后才能切换
+      b.disabled = b.dataset.mode === 'hint' && isMatch() && inGame;
+      b.title = b.disabled ? '比赛进行中不能切换，到达目标后再切' : '';
+    }
+  }
+
+  function renderLocked() {
+    const left = Math.max(0, MATCH_ASKS - usedAsks());
+    $('.list').innerHTML = `<li class="locked muted">比赛模式：推荐已隐藏<br>本局还能询问 <b>${left}</b> / ${MATCH_ASKS} 次<br>
+      <button class="ask" ${left ? '' : 'disabled'}>${left ? '询问这一页' : '本局次数已用完'}</button></li>`;
   }
 
   function renderNeedTarget() {
@@ -948,7 +1016,7 @@
     const k = e.key.toLowerCase();
     if (k === 'w' || e.code === 'KeyW') {
       settings.hidden = !settings.hidden; saveSettings(); applyLayout(); e.preventDefault();
-    } else if ((k === 'j' || e.code === 'KeyJ') && lastResult && lastResult.ranked.length) {
+    } else if ((k === 'j' || e.code === 'KeyJ') && revealed() && lastResult && lastResult.ranked.length) {
       const n = Math.min(SHOW_TOP, lastResult.ranked.length);
       jumpTo(lastResult.ranked[cycle % n]);
       cycle++;

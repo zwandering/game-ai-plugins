@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- 无头 Chrome 冒烟测试：比赛模式每局只能询问 1 次。
+     google-chrome --headless=new --dump-dom --virtual-time-budget=20000 file://$PWD/test/ui-match.html | grep RESULT -->
+<html><head><meta charset="utf-8"><title>match test</title></head>
+<body>
+<div class="game-page"><span class="timer-goal-text">Goal: Music</span>
+  <div class="wiki-article"><h1 class="wiki-title">Tiramisu</h1>
+    <div class="wiki-content"><div class="mw-parser-output" id="art">
+      <p><a href="/wiki/Italy">Italy</a> <a href="/wiki/Coffee">Coffee</a> <a href="/wiki/Dessert">Dessert</a></p>
+    </div></div>
+  </div>
+</div>
+<pre id="out">RESULT pending</pre>
+<script>
+  localStorage.setItem('wikiraceHelper.settings.v1', JSON.stringify({ highlight: true, mode: 'match' }));
+  sessionStorage.clear();
+</script>
+<script src="../dist/extension/core.js"></script>
+<script src="../dist/extension/ui.js"></script>
+<script>
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const goTo = (title, links) => {
+    document.querySelector('h1.wiki-title').textContent = title;
+    document.getElementById('art').innerHTML = '<p>' + links.map(t => `<a href="/wiki/${t}">${t}</a>`).join(' ') + '</p>';
+  };
+  (async () => {
+    const r = {};
+    try {
+      await wait(1500);
+      const sh = document.querySelector('.wrh-ignore').shadowRoot;
+      const q = s => sh.querySelector(s);
+      const hintBtn = () => q('.modes button[data-mode=hint]');
+      r.lockedAtStart = !!q('.ask') && !q('.ask').disabled && !q('.item');
+      r.hintLockedInGame = hintBtn().disabled;
+      r.noHighlightBefore = document.querySelectorAll('.wrh-hl').length === 0;
+      q('.ask').click();
+      r.usedAfterAsk = Object.keys(sessionStorage).filter(k => k.startsWith('wikiraceHelper.matchUsed.')).map(k => sessionStorage.getItem(k)).join();
+      r.revealedAfterAsk = !q('.ask');
+      await wait(8000);
+      r.itemsAfterAsk = sh.querySelectorAll('.item').length;
+      goTo('Italy', ['Opera', 'Rome', 'Music']);
+      await wait(1500);
+      r.lockedOnNextPage = !!q('.ask') && !sh.querySelector('.item');
+      r.askDisabledWhenUsed = !!q('.ask') && q('.ask').disabled;
+      r.noHighlightNextPage = document.querySelectorAll('.wrh-hl').length === 0;
+      goTo('Music', ['Sound']);
+      await wait(1500);
+      r.hintUnlockedAtTarget = !hintBtn().disabled;
+      r.usedResetAtTarget = !Object.keys(sessionStorage).some(k => k.startsWith('wikiraceHelper.matchUsed.'));
+      hintBtn().click();
+      await wait(300);
+      r.switchedToHint = JSON.parse(localStorage.getItem('wikiraceHelper.settings.v1')).mode === 'hint' && !q('.ask');
+    } catch (e) { r.error = String(e); }
+    const ok = !r.error && Object.entries(r).every(([k, v]) => k === 'usedAfterAsk' ? v === '1' : k === 'itemsAfterAsk' ? v > 0 : v === true);
+    document.getElementById('out').textContent = 'RESULT ' + (ok ? 'PASS ' : 'FAIL ') + JSON.stringify(r);
+  })();
+</script>
+</body></html>

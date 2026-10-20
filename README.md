@@ -38,6 +38,16 @@ node build.js
 | “改” | 手动输入目标（识别不到目标时用；留空回车恢复自动识别） |
 | “高亮文章内链接” | 关掉后只看面板，不改文章外观 |
 
+### 比赛模式
+
+面板上的“提示 / 比赛”用来切换模式。比赛模式下：
+
+- 平时不显示推荐，也不高亮链接，只有一个“询问这一页”按钮。
+- **每局只能询问 1 次**。点了就揭晓当前这一页的推荐（还在计算时会边算边显示），跳到下一页后重新隐藏。
+- 次数存在当前标签页里，刷新页面不会重置；到达目标后清零，下一局重新计数。
+- 一局进行中不能切回提示模式，到达目标或离开对局后才能切换。
+- 只在你自己的电脑上生效，不会在聊天里发消息，别人看不到。
+
 目标从页面上的 “Goal: …” 和网址里的 `end=` 参数识别，语言从 `language=` 参数识别（默认英文维基）。
 
 状态栏的含义：`反链` 是已经加载的“链接到目标的条目”数量；`外圈` 只在目标比较冷门时出现，表示再往外一圈的加载进度；`请求/分` 是最近一分钟发给 Wikipedia 的请求数。
@@ -68,6 +78,7 @@ node build.js
 npm install          # 只为测试装 linkedom
 node test/unit.js    # 离线单元测试（清洗规则、调度器、伪造的小维基上的寻路）
 google-chrome --headless=new --dump-dom --virtual-time-budget=8000 "file://$PWD/test/ui-hidden.html" | grep RESULT   # 面板隐藏/恢复
+google-chrome --headless=new --dump-dom --virtual-time-budget=30000 "file://$PWD/test/ui-match.html" | grep RESULT   # 比赛模式
 node test/sim.js     # 在线模拟：每步都点排第一的链接，统计步数
 node test/sim.js "Pogo stick" "Rafflesia" --think 2000
 ```
